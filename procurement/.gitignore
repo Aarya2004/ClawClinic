@@ -1,0 +1,7 @@
+.pharmasupply-wallet.json
+pharmasupply_invoices.json
+.pending_restocks.json
+*.log
+__pycache__/
+*.pyc
+.env

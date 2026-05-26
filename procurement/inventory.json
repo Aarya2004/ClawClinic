@@ -1,0 +1,9 @@
+{
+  "FLU-TRAY-100": {
+    "name": "Fluoride trays (box of 100)",
+    "on_hand": 12,
+    "threshold": 20,
+    "unit_price_usd": 0.5,
+    "supplier_sku": "FLU-TRAY-100"
+  }
+}
