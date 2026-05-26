@@ -1,0 +1,21 @@
+{
+  "clinic": "Downtown Dental Toronto",
+  "timezone": "America/Toronto",
+  "price_per_booking_usdc": 1.00,
+  "slots": [
+    {"id": "s_001", "date": "2026-05-27", "time": "09:00", "service": "Cleaning",   "available": true},
+    {"id": "s_002", "date": "2026-05-27", "time": "10:30", "service": "Cleaning",   "available": true},
+    {"id": "s_003", "date": "2026-05-27", "time": "13:00", "service": "Consult",    "available": true},
+    {"id": "s_004", "date": "2026-05-27", "time": "15:30", "service": "Filling",    "available": false},
+    {"id": "s_005", "date": "2026-05-28", "time": "09:00", "service": "Cleaning",   "available": true},
+    {"id": "s_006", "date": "2026-05-28", "time": "11:00", "service": "Whitening",  "available": true},
+    {"id": "s_007", "date": "2026-05-28", "time": "14:00", "service": "Consult",    "available": true}
+  ],
+  "hours": {
+    "mon-fri": "08:00 - 18:00",
+    "sat":     "09:00 - 14:00",
+    "sun":     "closed"
+  },
+  "insurance_accepted": ["Sun Life", "Manulife", "Canada Life", "Green Shield", "Pacific Blue Cross"],
+  "address": "123 King St W, Toronto, ON"
+}
