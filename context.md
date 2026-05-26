@@ -29,8 +29,9 @@ Pitch line: *"Clinics lose $50–150 per missed call; 30% of calls go unanswered
 | **ElevenLabs + Twilio voice** | ✅ live, calls Hermes via local proxy on `:8643`, ngrok-exposed |
 | Voice booking + status tools (ElevenLabs server tools → `/book`, `/appointment_status`) | ✅ |
 | Shared bookings store between voice + Telegram (`voice/bookings.csv` + `bookings.py` lookup) | ✅ |
-| **A2A procurement (PharmaSupply)** — `/restock` autonomous flow with real on-chain settlement | ✅ verified $0.50 USDC tx `0xf86370a8…` |
-| Stacked spending guardrails — per-restock + rolling 24h cap | ✅ |
+| **A2A procurement (PharmaSupply)** — `/restock` with **always-confirm** flow and real on-chain settlement | ✅ verified `0xf86370a8…` (auto) + `0x50fe0c65…` (explicit) |
+| `/restock` accepts free-text item names with fuzzy SKU matching (e.g. `/restock ibuprofen 50`) | ✅ 5 SKUs in catalog incl. ibuprofen, gloves, masks, gauze, fluoride |
+| Stacked spending guardrails — per-restock + rolling 24h cap; **every** spend requires confirmation token | ✅ |
 | **`/onboard` clinic configuration** — set spending limits, manage inventory SKUs, edit clinic facts; every write gated by `CONFIRM-ONBOARD-XXXXXX`; abort route via `/onboard abort` | ✅ |
 | **SMS OTP two-factor** for every `/onboard` propose (Twilio REST → operator phone) | ✅ `sms_required=true` by default; 6-digit code, 10 min TTL, 5 wrong-code lockout |
 | Audit log of every propose / apply / abort + SMS success/failure (`procurement/.onboard_audit.log`) | ✅ |
@@ -147,9 +148,18 @@ The `evm-wallet-skill`'s `src/lib/gas.js` had a hardcoded **0.1 gwei priority-fe
 
 ## A2A procurement (PharmaSupply) — `/restock`
 
-**Story for judges:** ClawClinic monitors clinic supply inventory; when an item drops below threshold, it delegates procurement to PharmaSupply (a second local agent we built), receives an invoice, **broadcasts a real USDC transfer on GOAT mainnet**, and PharmaSupply confirms the payment by checking the transaction receipt against the GOAT RPC for the USDC Transfer event recipient + amount. No human in the loop for spend at or below the autonomous limit.
+**Story for judges:** ClawClinic delegates supply procurement to PharmaSupply (a second local agent), receives an invoice, **broadcasts a real USDC transfer on GOAT mainnet**, and PharmaSupply confirms payment by checking the transaction receipt against the GOAT RPC for the USDC Transfer event recipient + amount. Every spend, regardless of size, requires the operator to echo a literal `CONFIRM-RESTOCK-XXXXXX` token first — there is no silent autonomous spending.
 
-**Verified live:** real $0.50 USDC tx `0xf86370a8674c13c3dd61e2897943a5052fa857f02746dca151d656adf6362691` on chain 2345.
+**Three input modes:**
+- `/restock` — auto-detect items below threshold, stage a proposal
+- `/restock <item words…> <qty>` — explicit single-item order. Item words are fuzzy-matched against PharmaSupply's catalog (e.g. "/restock ibuprofen 50" → IBU-100MG-100). qty must be the last token.
+- `/restock CONFIRM-RESTOCK-XXXXXX` — apply a previously staged proposal. Re-checks the 24h cap at apply time.
+
+**PharmaSupply catalog (5 SKUs):** fluoride trays, nitrile gloves, surgical masks, ibuprofen 100mg, sterile gauze 4x4. Each has keywords for fuzzy matching ("advil" → ibuprofen, "ppe" → masks).
+
+**Verified live:** two real txes on chain 2345 —
+- $0.50 USDC `0xf86370a8674c13c3dd61e2897943a5052fa857f02746dca151d656adf6362691` (auto-mode)
+- $1.20 USDC `0x50fe0c65d4442f5c74591fc3db3a1bbdfadcbff7094a6edf81077206032a72c1` (explicit-mode `/restock gloves 1`)
 
 **Topology:**
 ```
@@ -377,7 +387,7 @@ Before resuming, **diff those files against this context** and reconcile. The ha
 2. **What it does (15 sec)** — "AI receptionist on Telegram AND voice. Books, answers FAQs, autonomously restocks supplies, charges clinics per outcome via x402 on GOAT."
 3. **Patient booking + x402 (40 sec)** — `/book` → `1 0xPAYER` → bot creates order → send $1 USDC from MetaMask → `status` → BK- confirmation → show tx on explorer.goat.network. **(Category: x402 integrity, customer side)**
 4. **Voice (30 sec)** — call the Twilio number, say "I'd like to book an appointment tomorrow morning, my name is X" → ElevenLabs agent confirms and reads back a `BK-` confirmation → check `/lookup BK-...` on Telegram to show the voice booking is visible to staff.
-5. **A2A machine payment + two-factor onboard guardrail (60 sec)** — `/onboard` (show $5 limit, sms_required=yes) → `/restock` (real $0.50 USDC tx broadcast + on-chain verified, ships) → `/onboard set-limit 0.10` → bot returns `CONFIRM-ONBOARD-XXXXXX` AND sends a 6-digit code to your phone via Twilio SMS → try `/onboard confirm <token>` without OTP → REJECTED ("a 6-digit SMS code was sent to your phone") → try with wrong OTP → REJECTED ("Incorrect code (1/5 attempts)") → confirm with the real OTP from SMS → applied. Then `/restock` halts with `CONFIRM-RESTOCK-XXXXXX` because $0.50 > $0.10 → try paraphrase "yes do it" → REJECTED → confirm with the literal token → proceeds → `/onboard set-limit 5 + OTP` → back to baseline. **(Categories: x402 integrity GREEN, guardrails GREEN with two-factor.)**
+5. **A2A machine payment + two-factor onboard guardrail (60 sec)** — `/onboard` (show $5 limit, sms_required=yes) → `/restock ibuprofen 5` (free-text → bot fuzzy-matches IBU-100MG-100, quotes $1.25, stages `CONFIRM-RESTOCK-XXXXXX` — no spend yet) → `/restock CONFIRM-RESTOCK-XXXXXX` (real $1.25 USDC tx broadcast + on-chain verified, ships) → `/onboard set-limit 0.10` → bot returns `CONFIRM-ONBOARD-XXXXXX` AND sends a 6-digit code to your phone via Twilio SMS → try `/onboard confirm <token>` without OTP → REJECTED ("a 6-digit SMS code was sent to your phone") → try with wrong OTP → REJECTED ("Incorrect code (1/5 attempts)") → confirm with the real OTP from SMS → applied. Then `/restock gloves 5` halts with extra "exceeds per-restock limit" wording because $6 > $0.10 → confirm with the literal token → proceeds → `/onboard set-limit 5 + OTP` → back to baseline. **(Categories: x402 integrity GREEN, guardrails GREEN with two-factor + always-confirm.)**
 6. **Identity (10 sec)** — show https://8004scan.io/agents/goat/29 — agent registered on mainnet.
 
 ---
