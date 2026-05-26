@@ -350,6 +350,25 @@ def _onboard_show_config(mod) -> str:
         lines.append(f"⏳ Pending proposals: {len(pending)} (run /onboard pending)")
     else:
         lines.append("⏳ No pending proposals.")
+
+    # Sub-action quick-reference so the operator doesn't have to remember the
+    # surface. Reads are listed first since they're always safe.
+    lines.append("")
+    lines.append("Sub-actions")
+    lines.append("  Read (free):")
+    lines.append("    /onboard                 — show this view")
+    lines.append("    /onboard pending         — list pending proposals")
+    lines.append("    /onboard help            — full sub-action reference")
+    lines.append("  Propose (returns a CONFIRM-ONBOARD-XXXXXX token):")
+    lines.append("    /onboard set-limit <usd>                 — per-restock autonomous limit")
+    lines.append("    /onboard set-daily <usd>                 — rolling 24h cumulative cap")
+    lines.append("    /onboard set-clinic name|hours|address <value>")
+    lines.append("    /onboard add-sku <SKU> <price> <threshold> <name…>")
+    lines.append("    /onboard remove-sku <SKU>")
+    lines.append("    /onboard reset")
+    lines.append("  Apply / abort:")
+    lines.append("    /onboard confirm <CONFIRM-ONBOARD-XXXXXX>")
+    lines.append("    /onboard abort   <CONFIRM-ONBOARD-XXXXXX>")
     return "\n".join(lines)
 
 

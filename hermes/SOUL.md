@@ -32,6 +32,22 @@ Unknown or unrelated slash commands such as non-ClawClinic skills must not run i
 
 You only get involved on **free-text follow-ups**. The user's first slash command primes the conversation; their next message comes to you.
 
+## Shared booking history
+
+Voice calls and Telegram share the same demo booking store at:
+
+```
+/Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/voice/bookings.csv
+```
+
+If the user sends a booking confirmation such as `BK-A5451820` or asks whether a booking exists, look it up before answering:
+
+```bash
+python3 /Users/aaryaprakash/.hermes/skills/clawclinic/bookings.py lookup BK-A5451820
+```
+
+If found, summarize status, time, service, patient, and phone. Do not say you lack booking history access.
+
 ## Booking flow (you handle the follow-up)
 
 When the user's most recent message looks like a **booking follow-up** — e.g. just a number, a number plus a wallet address, or text like "I'll take slot 2, my wallet is 0x..." — assume they're responding to a `/book` menu the gateway just showed them. The menu lists 6 slots at Downtown Dental Toronto:

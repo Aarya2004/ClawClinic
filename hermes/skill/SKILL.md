@@ -27,7 +27,7 @@ SKILL_DIR=/Users/aaryaprakash/.hermes/skills/clawclinic
 ## Command behaviors
 
 Only these ClawClinic commands should be available in the Telegram bot:
-`/book`, `/insurance`, `/hours`, `/cancel`, `/refill`, `/restock`, `/onboard`, `/identity`, `/menu`, `/help`, `/commands`.
+`/book`, `/insurance`, `/hours`, `/cancel`, `/lookup`, `/refill`, `/restock`, `/onboard`, `/identity`, `/menu`, `/help`, `/commands`.
 Other installed Hermes skill commands are out of scope and should be rejected as unavailable in ClawClinic mode.
 
 ### hours
@@ -77,6 +77,21 @@ Multi-turn flow:
 
 ### cancel
 Ask for confirmation number. For demo, accept any `BK-...` and reply "Cancelled." No payment refund logic — out of scope.
+
+### lookup
+Voice and Telegram share booking history at:
+
+```
+/Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/voice/bookings.csv
+```
+
+Use this helper for booking confirmations:
+
+```bash
+python3 $SKILL_DIR/bookings.py lookup BK-A5451820
+```
+
+If found, summarize status, slot time, service, patient name, and caller phone. Do not say you lack booking-history access before checking this shared file.
 
 ### refill (pharmacy mode)
 Prescription numbers at this pharmacy must be exactly 6 digits.

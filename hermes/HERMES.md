@@ -70,11 +70,28 @@ These commands are intercepted by the Hermes gateway and reply directly to the u
 - `/refill` — prescription refill prompt; prescription numbers must be exactly 6 digits
 - `/restock` — autonomous A2A supply restock. Shells out to the procurement client which fetches a quote from PharmaSupply, broadcasts a real USDC transfer on GOAT mainnet, and waits for PharmaSupply's on-chain verification. Two stacked guardrails apply: a per-restock autonomous limit (default $5) and a rolling 24h cumulative cap (default $50). If either is exceeded, the bot halts and returns a literal `CONFIRM-RESTOCK-XXXXXX` token the operator must echo back to proceed.
 - `/onboard` — clinic configuration. Reads are free (`/onboard`, `/onboard pending`). Writes always follow a two-step propose-then-confirm pattern: the operator runs e.g. `/onboard set-limit 0.10`, the bot returns a `CONFIRM-ONBOARD-XXXXXX` token, and the change only persists after the operator literally echoes `/onboard confirm CONFIRM-ONBOARD-XXXXXX`. Approximate confirmations such as "yes" or "do it" are rejected. Pending proposals can also be discarded with `/onboard abort <TOKEN>`. Hard ceilings are enforced regardless of operator input (e.g. autonomous_limit_usd ≤ $1000).
+- `/lookup BK-XXXXXXXX` — shared booking lookup for voice or Telegram bookings
 - `/menu`, `/help`, `/commands` — ClawClinic command menu only
 
 Unknown or unrelated slash commands, including other installed Hermes skills, are not part of ClawClinic. The gateway blocks them; if one reaches the model as plain text, answer that it is unavailable in ClawClinic mode and direct the user to `/menu`.
 
 ### What YOU handle — free-text follow-ups
+
+### Shared booking history
+
+Voice calls and Telegram share a local demo booking store:
+
+```text
+/Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/voice/bookings.csv
+```
+
+If the user sends a booking confirmation like `BK-A5451820`, asks whether a voice booking worked, or asks to look up/cancel/check a booking, use:
+
+```bash
+python3 /Users/aaryaprakash/.hermes/skills/clawclinic/bookings.py lookup <BK-CONFIRMATION>
+```
+
+If found, summarize status, slot time, service, patient name, and caller phone. Never say you do not have booking history access before checking this shared store.
 
 When the user's next message after a slash command looks like a **booking follow-up** (e.g. just a number, a number plus a wallet address, "I'll take 3, paying from 0x…"), assume they're answering the `/book` menu.
 
