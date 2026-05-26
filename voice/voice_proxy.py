@@ -32,6 +32,7 @@ import random
 import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import uuid
@@ -112,6 +113,24 @@ def write_all_bookings(rows: list) -> None:
 
 def make_confirmation() -> str:
     return f"BK-{uuid.uuid4().hex[:8].upper()}"
+
+
+def unwrap_tool_payload(payload: dict) -> dict:
+    """Accept common webhook/tool argument wrappers without failing the call."""
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("parameters", "arguments", "args", "input", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return payload
 
 # Emit a short spoken filler on some slow turns. The delay is jittered and
 # the probability keeps the voice experience from sounding scripted.
@@ -201,9 +220,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/health", "/v1/health"):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/health", "/v1/health"):
             return self._json(200, {"status": "ok", "proxy": "clawclinic-voice"})
-        if self.path == "/bookings":
+        if path == "/bookings":
             rows = []
             if os.path.exists(BOOKINGS_CSV):
                 with open(BOOKINGS_CSV, newline="") as f:
@@ -218,7 +238,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
-            return self._json(400, {"ok": False, "error": "bad json"})
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "status": "needs_more_info",
+                    "message": "I had trouble reading the booking details. Please ask the caller for the time and name again.",
+                },
+            )
+        payload = unwrap_tool_payload(payload)
 
         slot_start_raw = (payload.get("slot_start") or "").strip()
         name = (payload.get("patient_name") or "").strip()
@@ -230,9 +258,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 200,
                 {
-                    "ok": False,
-                    "error": "missing_required",
-                    "message": "I need both a slot start time and a patient name to book.",
+                    "ok": True,
+                    "status": "needs_more_info",
+                    "missing": [
+                        *([] if slot_start_raw else ["slot_start"]),
+                        *([] if name else ["patient_name"]),
+                    ],
+                    "message": "I need both a slot start time and a patient name to book. Ask for the missing detail, then try again.",
                 },
             )
 
@@ -241,8 +273,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 200,
                 {
-                    "ok": False,
-                    "error": "bad_datetime",
+                    "ok": True,
+                    "status": "needs_more_info",
                     "message": (
                         "I couldn't parse that time. Please use an ISO 8601 datetime "
                         "like 2026-05-27T09:00:00."
@@ -270,8 +302,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json(
                             200,
                             {
-                                "ok": False,
-                                "error": "slot_taken",
+                                "ok": True,
+                                "status": "slot_taken",
                                 "conflicting_slot_start": row.get("slot_start"),
                                 "conflicting_slot_end": row.get("slot_end"),
                                 "message": (
@@ -304,6 +336,7 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {
                 "ok": True,
+                "status": "booked",
                 "confirmation": confirmation,
                 "slot_start": slot_start_iso,
                 "slot_end": slot_end_iso,
@@ -453,11 +486,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
-        if self.path == "/book":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/book":
             return self.handle_booking()
-        if self.path == "/appointment_status":
+        if path == "/appointment_status":
             return self.handle_status()
-        if self.path != "/v1/chat/completions":
+        if path != "/v1/chat/completions":
             self.send_error(404)
             return
 
@@ -601,8 +635,13 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[proxy] downstream write error: {e}", flush=True)
 
 
+class VoiceHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = VoiceHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"voice proxy listening on http://127.0.0.1:{PORT}", flush=True)
     server.serve_forever()
 
