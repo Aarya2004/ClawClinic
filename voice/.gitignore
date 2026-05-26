@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+bookings.csv
+bookings.csv.*
+*.log
+.env
