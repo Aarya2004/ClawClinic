@@ -26,6 +26,7 @@ import copy
 import json
 import os
 import random
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -58,25 +59,28 @@ OPERATOR_FIELDS_WRITABLE = {"phone_e164", "sms_required"}
 SMS_FROM_NUMBER = "+16477244594"
 SMS_OTP_TTL_SECONDS = 600  # 10 min
 SMS_MAX_ATTEMPTS = 5
+IO_LOCK = threading.RLock()
 
 
 # ─── low-level io ──────────────────────────────────────────────────────
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    with IO_LOCK:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
 
 
 def _read_json(path: Path, default: Any = None) -> Any:
-    if not path.exists():
-        return default
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return default
+    with IO_LOCK:
+        if not path.exists():
+            return default
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return default
 
 
 def _append_audit(event: str, detail: dict) -> None:
@@ -85,8 +89,9 @@ def _append_audit(event: str, detail: dict) -> None:
         "event": event,
         **detail,
     })
-    with open(AUDIT_LOG_PATH, "a") as f:
-        f.write(line + "\n")
+    with IO_LOCK:
+        with open(AUDIT_LOG_PATH, "a") as f:
+            f.write(line + "\n")
 
 
 # ─── config getters ────────────────────────────────────────────────────
@@ -142,14 +147,15 @@ def _write_ledger(rows: list) -> None:
 
 
 def record_spend(amount_usd: float, tx_hash: str, sku: str) -> None:
-    rows = _read_ledger()
-    rows.append({
-        "ts": _now_ts(),
-        "amount_usd": float(amount_usd),
-        "tx_hash": tx_hash,
-        "sku": sku,
-    })
-    _write_ledger(rows)
+    with IO_LOCK:
+        rows = _read_ledger()
+        rows.append({
+            "ts": _now_ts(),
+            "amount_usd": float(amount_usd),
+            "tx_hash": tx_hash,
+            "sku": sku,
+        })
+        _write_ledger(rows)
 
 
 def spend_last_24h() -> float:
@@ -231,53 +237,54 @@ def propose_change(action: str, payload: dict) -> tuple[str, dict]:
     operator.sms_required is false and the SMS send failed (graceful
     degradation: a literal-token-only confirmation is still accepted).
     """
-    token = make_proposal_token()
-    proposals = _read_proposals()
-    record: dict[str, Any] = {
-        "action": action,
-        "payload": payload,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    with IO_LOCK:
+        token = make_proposal_token()
+        proposals = _read_proposals()
+        record: dict[str, Any] = {
+            "action": action,
+            "payload": payload,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     # Generate + send OTP if operator phone is configured
-    op = operator_config()
-    phone = (op.get("phone_e164") or "").strip()
-    sms_required = bool(op.get("sms_required", False))
-    otp_status = {"sms_sent": False, "sms_required": sms_required, "phone_masked": ""}
+        op = operator_config()
+        phone = (op.get("phone_e164") or "").strip()
+        sms_required = bool(op.get("sms_required", False))
+        otp_status = {"sms_sent": False, "sms_required": sms_required, "phone_masked": ""}
 
-    if phone:
-        otp = _make_otp()
-        record["otp_hash"] = otp  # plaintext is fine for this scope (single host, gitignored)
-        record["otp_expires_at"] = time.time() + SMS_OTP_TTL_SECONDS
-        record["otp_attempts"] = 0
-        ok, info = _twilio_send_sms(
-            phone,
-            f"ClawClinic confirmation code: {otp}\n"
-            f"Token: {token}\n"
-            f"Action: {action}\n"
-            f"This code expires in {SMS_OTP_TTL_SECONDS // 60} minutes.",
-        )
-        otp_status["sms_sent"] = ok
-        otp_status["sms_info"] = info
-        otp_status["phone_masked"] = phone[:3] + "***" + phone[-4:]
-        if not ok and sms_required:
-            # Strict mode: bail without persisting a proposal
-            _append_audit(
-                "propose_failed_sms",
-                {"action": action, "payload": payload, "sms_info": info},
+        if phone:
+            otp = _make_otp()
+            record["otp_hash"] = otp  # plaintext is fine for this scope (single host, gitignored)
+            record["otp_expires_at"] = time.time() + SMS_OTP_TTL_SECONDS
+            record["otp_attempts"] = 0
+            ok, info = _twilio_send_sms(
+                phone,
+                f"ClawClinic confirmation code: {otp}\n"
+                f"Token: {token}\n"
+                f"Action: {action}\n"
+                f"This code expires in {SMS_OTP_TTL_SECONDS // 60} minutes.",
             )
-            return token, {**otp_status, "ok": False, "error": "sms_required_but_failed"}
+            otp_status["sms_sent"] = ok
+            otp_status["sms_info"] = info
+            otp_status["phone_masked"] = phone[:3] + "***" + phone[-4:]
+            if not ok and sms_required:
+                # Strict mode: bail without persisting a proposal
+                _append_audit(
+                    "propose_failed_sms",
+                    {"action": action, "payload": payload, "sms_info": info},
+                )
+                return token, {**otp_status, "ok": False, "error": "sms_required_but_failed"}
 
-    proposals[token] = record
-    _write_proposals(proposals)
-    _append_audit("propose", {
-        "token": token,
-        "action": action,
-        "payload": payload,
-        "sms_sent": otp_status["sms_sent"],
-    })
-    otp_status["ok"] = True
-    return token, otp_status
+        proposals[token] = record
+        _write_proposals(proposals)
+        _append_audit("propose", {
+            "token": token,
+            "action": action,
+            "payload": payload,
+            "sms_sent": otp_status["sms_sent"],
+        })
+        otp_status["ok"] = True
+        return token, otp_status
 
 
 def list_proposals() -> dict:
@@ -291,13 +298,14 @@ def list_proposals() -> dict:
 
 def abort_proposal(token: str) -> bool:
     """Remove a pending proposal without applying it."""
-    proposals = _read_proposals()
-    if token not in proposals:
-        return False
-    detail = {k: v for k, v in proposals.pop(token).items() if k != "otp_hash"}
-    _write_proposals(proposals)
-    _append_audit("abort", {"token": token, **detail})
-    return True
+    with IO_LOCK:
+        proposals = _read_proposals()
+        if token not in proposals:
+            return False
+        detail = {k: v for k, v in proposals.pop(token).items() if k != "otp_hash"}
+        _write_proposals(proposals)
+        _append_audit("abort", {"token": token, **detail})
+        return True
 
 
 def apply_proposal(token: str, otp: str | None = None) -> tuple[bool, str, dict | None]:
@@ -310,82 +318,83 @@ def apply_proposal(token: str, otp: str | None = None) -> tuple[bool, str, dict 
     - If sms_required is false, a missing OTP is allowed (fallback path) but
       an OTP that IS provided must still match if one was generated.
     """
-    proposals = _read_proposals()
-    prop = proposals.get(token)
-    if prop is None:
-        return False, "Unknown or already-used confirmation token.", None
+    with IO_LOCK:
+        proposals = _read_proposals()
+        prop = proposals.get(token)
+        if prop is None:
+            return False, "Unknown or already-used confirmation token.", None
 
-    sms_required = bool(operator_config().get("sms_required", False))
-    expected_otp = prop.get("otp_hash")
+        sms_required = bool(operator_config().get("sms_required", False))
+        expected_otp = prop.get("otp_hash")
 
-    if expected_otp:
+        if expected_otp:
         # OTP was generated for this proposal
-        expires = prop.get("otp_expires_at", 0)
-        if time.time() > expires:
-            del proposals[token]
-            _write_proposals(proposals)
-            _append_audit("apply_failed_expired", {"token": token})
-            return False, "Confirmation code has expired. Please /onboard set-... again.", None
+            expires = prop.get("otp_expires_at", 0)
+            if time.time() > expires:
+                del proposals[token]
+                _write_proposals(proposals)
+                _append_audit("apply_failed_expired", {"token": token})
+                return False, "Confirmation code has expired. Please /onboard set-... again.", None
 
-        if otp is None:
-            if sms_required:
-                return False, (
-                    "A 6-digit SMS code was sent to your phone. "
-                    "Reply with:  /onboard confirm <TOKEN> <6-digit-code>"
-                ), None
-            # Fallback: literal-only when sms_required is false. Proceed.
-        else:
-            otp_clean = (otp or "").strip().replace("-", "").replace(" ", "")
-            if otp_clean != expected_otp:
-                prop["otp_attempts"] = int(prop.get("otp_attempts", 0)) + 1
-                if prop["otp_attempts"] >= SMS_MAX_ATTEMPTS:
-                    del proposals[token]
+            if otp is None:
+                if sms_required:
+                    return False, (
+                        "A 6-digit SMS code was sent to your phone. "
+                        "Reply with:  /onboard confirm <TOKEN> <6-digit-code>"
+                    ), None
+                # Fallback: literal-only when sms_required is false. Proceed.
+            else:
+                otp_clean = (otp or "").strip().replace("-", "").replace(" ", "")
+                if otp_clean != expected_otp:
+                    prop["otp_attempts"] = int(prop.get("otp_attempts", 0)) + 1
+                    if prop["otp_attempts"] >= SMS_MAX_ATTEMPTS:
+                        del proposals[token]
+                        _write_proposals(proposals)
+                        _append_audit(
+                            "apply_failed_lockout",
+                            {"token": token, "attempts": prop["otp_attempts"]},
+                        )
+                        return False, (
+                            f"Too many incorrect codes ({SMS_MAX_ATTEMPTS}). "
+                            "Proposal cancelled — please /onboard set-... again."
+                        ), None
+                    proposals[token] = prop
                     _write_proposals(proposals)
                     _append_audit(
-                        "apply_failed_lockout",
+                        "apply_failed_bad_otp",
                         {"token": token, "attempts": prop["otp_attempts"]},
                     )
                     return False, (
-                        f"Too many incorrect codes ({SMS_MAX_ATTEMPTS}). "
-                        "Proposal cancelled — please /onboard set-... again."
+                        f"Incorrect code ({prop['otp_attempts']}/{SMS_MAX_ATTEMPTS} attempts). "
+                        "Please re-enter the 6-digit SMS code."
                     ), None
-                proposals[token] = prop
-                _write_proposals(proposals)
-                _append_audit(
-                    "apply_failed_bad_otp",
-                    {"token": token, "attempts": prop["otp_attempts"]},
-                )
-                return False, (
-                    f"Incorrect code ({prop['otp_attempts']}/{SMS_MAX_ATTEMPTS} attempts). "
-                    "Please re-enter the 6-digit SMS code."
-                ), None
 
-    elif sms_required:
+        elif sms_required:
         # sms_required is true but no OTP was generated for this proposal —
         # probably created when SMS was failing. Refuse.
-        return False, (
-            "This proposal has no SMS code on file but sms_required is true. "
-            "Please /onboard set-... again."
-        ), None
+            return False, (
+                "This proposal has no SMS code on file but sms_required is true. "
+                "Please /onboard set-... again."
+            ), None
 
-    action = prop["action"]
-    payload = prop["payload"]
+        action = prop["action"]
+        payload = prop["payload"]
 
-    cfg = load_config()
-    cfg = _apply_to_config(cfg, action, payload)
-    if cfg is None:
-        return False, f"Could not apply {action}: payload no longer valid.", None
+        cfg = load_config()
+        cfg = _apply_to_config(cfg, action, payload)
+        if cfg is None:
+            return False, f"Could not apply {action}: payload no longer valid.", None
 
-    _atomic_write_json(CONFIG_PATH, cfg)
-    del proposals[token]
-    _write_proposals(proposals)
-    _append_audit("apply", {
-        "token": token,
-        "action": action,
-        "payload": payload,
-        "used_otp": expected_otp is not None and otp is not None,
-    })
-    return True, f"Applied {action}.", payload
+        _atomic_write_json(CONFIG_PATH, cfg)
+        del proposals[token]
+        _write_proposals(proposals)
+        _append_audit("apply", {
+            "token": token,
+            "action": action,
+            "payload": payload,
+            "used_otp": expected_otp is not None and otp is not None,
+        })
+        return True, f"Applied {action}.", payload
 
 
 def _apply_to_config(cfg: dict, action: str, payload: dict) -> dict | None:
