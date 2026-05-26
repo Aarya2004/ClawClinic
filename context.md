@@ -32,7 +32,8 @@ Pitch line: *"Clinics lose $50–150 per missed call; 30% of calls go unanswered
 | **A2A procurement (PharmaSupply)** — `/restock` autonomous flow with real on-chain settlement | ✅ verified $0.50 USDC tx `0xf86370a8…` |
 | Stacked spending guardrails — per-restock + rolling 24h cap | ✅ |
 | **`/onboard` clinic configuration** — set spending limits, manage inventory SKUs, edit clinic facts; every write gated by `CONFIRM-ONBOARD-XXXXXX`; abort route via `/onboard abort` | ✅ |
-| Audit log of every propose / apply / abort (`procurement/.onboard_audit.log`) | ✅ |
+| **SMS OTP two-factor** for every `/onboard` propose (Twilio REST → operator phone) | ✅ `sms_required=true` by default; 6-digit code, 10 min TTL, 5 wrong-code lockout |
+| Audit log of every propose / apply / abort + SMS success/failure (`procurement/.onboard_audit.log`) | ✅ |
 | GitHub repo `Aarya2004/ClawClinic` pushed | ✅ https://github.com/Aarya2004/ClawClinic |
 | Submission form | ⏳ |
 | Demo rehearsal | ⏳ |
@@ -83,7 +84,7 @@ The `evm-wallet-skill`'s `src/lib/gas.js` had a hardcoded **0.1 gwei priority-fe
 | `~/.hermes/skills/clawclinic/slots.json` | Fake clinic backend |
 | `~/.hermes/hermes-agent/gateway/run.py` | Patched: `_CLAWCLINIC_COMMANDS` allowlist + menu both updated to include `/restock` and `/onboard` |
 | `~/.hermes/config.yaml` | `plugins.enabled: [clawclinic]`, `display.platforms.telegram.tool_progress: off`, `streaming.enabled: true` (needed for ElevenLabs SSE), API server env vars in `.env` |
-| `~/.hermes/.env` | `X402_API_KEY`, `X402_API_SECRET`, `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, plus `API_SERVER_ENABLED=true` + `API_SERVER_KEY=<bearer>` for the OpenAI-compatible API server on port 8642 |
+| `~/.hermes/.env` | `X402_API_KEY`, `X402_API_SECRET`, `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, plus `API_SERVER_ENABLED=true` + `API_SERVER_KEY=<bearer>` for the OpenAI-compatible API server on port 8642, plus `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` for the `/onboard` SMS OTP. Token was pasted in plaintext once during build — **rotate via Twilio console before any real production use**. |
 
 ### Repo subdirectories — all live in `GOAT-Hackathon-2026/`
 
@@ -95,7 +96,7 @@ The `evm-wallet-skill`'s `src/lib/gas.js` had a hardcoded **0.1 gwei priority-fe
 | `voice/bookings.csv` | Shared booking store between voice + Telegram. Gitignored. |
 | `procurement/pharmasupply_server.py` | Second local agent on `127.0.0.1:8645`. Quotes + invoices + on-chain payment verification via `eth_getTransactionReceipt` against `rpc.goat.network`. Confirms USDC Transfer event recipient + amount before marking an invoice PAID. Receive-only wallet at `procurement/.pharmasupply-wallet.json` (gitignored). |
 | `procurement/procurement_client.py` | ClawClinic side of the A2A loop. Reads `inventory.json`, fetches PharmaSupply quote, **broadcasts a real USDC transfer on GOAT mainnet via the `evm-wallet-skill`**, settles with PharmaSupply, updates inventory + spend ledger. |
-| `procurement/clinic_config.py` | Single source of truth for runtime-editable spending limits + inventory thresholds + clinic facts. Atomic JSON writes, propose-then-apply pattern, rolling 24h spend ledger, audit log. |
+| `procurement/clinic_config.py` | Single source of truth for runtime-editable spending limits + inventory thresholds + clinic facts. Atomic JSON writes, propose-then-apply pattern, rolling 24h spend ledger, audit log. **Also**: generates a 6-digit OTP per propose and sends it via Twilio to `operator.phone_e164`. Twilio creds read from `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` env vars; the "from" number is hardcoded as a constant so an attacker can't redirect OTPs through `/onboard`. |
 | `procurement/clinic_config.default.json` | Seed config (autonomous limit $5, daily cap $50, one SKU). Used the first time `/onboard` runs. |
 | `procurement/clinic_config.json` | Runtime config. Gitignored. |
 | `procurement/inventory.json` | Current on-hand quantities per SKU. |
@@ -119,6 +120,8 @@ The `evm-wallet-skill`'s `src/lib/gas.js` had a hardcoded **0.1 gwei priority-fe
 8. **Strict command allowlist lives in the gateway**, not just the plugin. `_CLAWCLINIC_COMMANDS` in `~/.hermes/hermes-agent/gateway/run.py:1064` is the set the gateway accepts; anything else returns "/X is not available in ClawClinic mode" *before* the plugin handler runs. Add new commands to BOTH the plugin AND that set.
 9. **`evm-wallet-skill/src/transfer.js` viem-2.x bug.** `walletClient.encodeFunctionData(...)` does not exist in viem ≥ 2.0. Patched to import `encodeFunctionData` directly from `viem` and call it as a free function. Without this patch, ERC20 transfers (including USDC restock payments) fail at gas-estimation with "encodeFunctionData is not a function". Same skill, separate patch from the gas.js fix.
 10. **ElevenLabs Custom-LLM cascade-timeout gotcha.** Default `cascade_timeout_seconds` is 8 s; if Hermes takes longer than that to emit the first content token, ElevenLabs disconnects with `custom_llm_error: LLM Cascade Error`. The voice proxy emits an immediate SSE `role` chunk to keep the connection alive, and we bumped the cascade timeout to 15 s in the ElevenLabs agent. Also: ElevenLabs requests `stream: true`; you MUST set `streaming.enabled: true` in `~/.hermes/config.yaml` or the api-server returns a non-streamed JSON body and ElevenLabs rejects it.
+11. **SMS OTP needs Twilio env vars in the GATEWAY process.** `clinic_config.py` reads `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` from `os.environ` at the moment of each propose. Those vars must be present in the process that runs the Hermes gateway, not just on the user shell. `hermes gateway restart` picks them up from `~/.hermes/.env` automatically. If you add or rotate the token, restart the gateway or new OTPs won't send.
+12. **Don't commit the Twilio token.** It lives only in `~/.hermes/.env` (chmod 600, not in the repo). The Account SID is fine to share, the Auth Token is password-equivalent. If it ever leaks, regenerate via the Twilio console — that invalidates the old one.
 
 ---
 
@@ -185,33 +188,48 @@ Settled. ClawClinic appends to inventory + 24h spend ledger.
 
 ## `/onboard` — clinic configuration with strict guardrails
 
-A single front-door command for runtime configuration. Reads are free; every write is staged behind a literal `CONFIRM-ONBOARD-XXXXXX` token that the operator must echo back verbatim. Approximate confirmations ("yes", "do it") are rejected.
+A single front-door command for runtime configuration. Reads are free; every write is staged behind a literal `CONFIRM-ONBOARD-XXXXXX` token AND a 6-digit SMS OTP sent to the operator's phone. Approximate confirmations ("yes", "do it") are always rejected.
 
 **Sub-actions:**
-- `/onboard` — show current config + 24h spend + pending proposal count + sub-action menu
+- `/onboard` — show current config + 24h spend + masked operator phone + pending proposal count + sub-action menu
 - `/onboard pending` — list pending proposals
 - `/onboard help` — full reference
 - `/onboard set-limit <usd>` — per-restock autonomous limit (hard ceiling $1000)
 - `/onboard set-daily <usd>` — rolling 24h cumulative cap (hard ceiling $10,000)
 - `/onboard set-clinic name|hours|address <value>` — clinic facts (only these 3 fields are writable)
+- `/onboard set-operator-phone <+E.164>` — phone that receives OTPs
+- `/onboard set-operator-sms-required true|false` — toggle whether SMS is mandatory
 - `/onboard add-sku <SKU> <unit_price> <threshold> <name…>` — add inventory item
 - `/onboard remove-sku <SKU>` — delete inventory item
 - `/onboard reset` — restore defaults
-- `/onboard confirm <CONFIRM-ONBOARD-XXXXXX>` — apply a pending proposal
+- `/onboard confirm <CONFIRM-ONBOARD-XXXXXX>` — literal-token-only (only accepted when `sms_required=false`)
+- `/onboard confirm <CONFIRM-ONBOARD-XXXXXX> <6-digit-code>` — two-factor confirm (required when `sms_required=true`)
 - `/onboard abort <CONFIRM-ONBOARD-XXXXXX>` — discard a pending proposal
 
-**Audit trail** — every propose / apply / abort event is appended to `procurement/.onboard_audit.log` as one JSON object per line with timestamp + action + payload. Survives gateway restarts.
+**Two-factor behaviour:**
+- Every propose generates a 6-digit numeric OTP via `random.SystemRandom()` and dispatches it to `operator.phone_e164` via the Twilio REST API.
+- OTPs expire after **10 minutes**.
+- Five wrong codes against the same proposal auto-aborts it and forces the operator to re-propose.
+- Twilio "from" number is hardcoded as `SMS_FROM_NUMBER = "+16477244594"` in `clinic_config.py` (so an attacker can't divert OTPs by editing config).
+- The proposal store (`procurement/.onboard_proposals.json`) holds the plaintext OTP — fine for this single-host demo scope; rotate to a real hash + HMAC if shipping.
+- If `sms_required=true` and Twilio fails to send (network down, creds bad), the propose itself is refused — no half-staged proposal.
+
+**Operator phone** is configured in `clinic_config.json` and defaults to `+16478590120`. SMS is currently REQUIRED (`sms_required=true`) — flip to false via `/onboard set-operator-sms-required false` (with its own OTP gate!) if you need a literal-token-only fallback.
+
+**Audit trail** — every propose / apply / abort / SMS-failure / wrong-OTP / lockout event is appended to `procurement/.onboard_audit.log` as one JSON object per line with timestamp + action + payload. Survives gateway restarts. OTP plaintext is NEVER logged.
 
 **Hard ceilings** — even with operator confirmation, autonomous_limit_usd is capped at $1000 and daily_cap_usd at $10,000. SKU thresholds are capped at 100,000 units and unit prices at $10,000.
 
 **Demo loop hitting both Cat 3 and Cat 4:**
-1. `/onboard` → show $5 limit, $50 daily cap
+1. `/onboard` → show $5 limit, $50 daily cap, sms_required=yes
 2. `/restock` → real $0.50 tx broadcast + verified (Cat 3 GREEN)
-3. `/onboard set-limit 0.10` → returns CONFIRM-ONBOARD token
+3. `/onboard set-limit 0.10` → returns CONFIRM-ONBOARD token + sends 6-digit code via SMS to operator phone
 4. `/onboard confirm yes do it` → REJECTED (paraphrase rejected — Cat 4 GREEN)
-5. `/onboard confirm <token>` → applied
-6. `/restock` → halts, returns CONFIRM-RESTOCK token because $0.50 > $0.10 limit (Cat 4 GREEN)
-7. `/onboard set-limit 5.00` → confirm → back to baseline
+5. `/onboard confirm <token>` without OTP → REJECTED ("a 6-digit SMS code was sent to your phone")
+6. `/onboard confirm <token> 000000` → REJECTED ("Incorrect code (1/5 attempts)")
+7. `/onboard confirm <token> <real-OTP-from-SMS>` → applied — that's textbook two-factor
+8. `/restock` → halts, returns CONFIRM-RESTOCK token because $0.50 > $0.10 limit (Cat 4 GREEN, second example)
+9. `/onboard set-limit 5.00` → confirm with OTP → back to baseline
 
 ---
 
@@ -359,7 +377,7 @@ Before resuming, **diff those files against this context** and reconcile. The ha
 2. **What it does (15 sec)** — "AI receptionist on Telegram AND voice. Books, answers FAQs, autonomously restocks supplies, charges clinics per outcome via x402 on GOAT."
 3. **Patient booking + x402 (40 sec)** — `/book` → `1 0xPAYER` → bot creates order → send $1 USDC from MetaMask → `status` → BK- confirmation → show tx on explorer.goat.network. **(Category: x402 integrity, customer side)**
 4. **Voice (30 sec)** — call the Twilio number, say "I'd like to book an appointment tomorrow morning, my name is X" → ElevenLabs agent confirms and reads back a `BK-` confirmation → check `/lookup BK-...` on Telegram to show the voice booking is visible to staff.
-5. **A2A machine payment + onboard guardrail (45 sec)** — `/onboard` (show $5 limit) → `/restock` (real $0.50 USDC tx broadcast + on-chain verified, ships) → `/onboard set-limit 0.10` → confirm with the literal token → `/restock` halts, demands `CONFIRM-RESTOCK` token → try paraphrase "yes do it" → REJECTED → `/onboard set-limit 5` confirm → back to baseline. **(Categories: x402 integrity GREEN, guardrails GREEN.)**
+5. **A2A machine payment + two-factor onboard guardrail (60 sec)** — `/onboard` (show $5 limit, sms_required=yes) → `/restock` (real $0.50 USDC tx broadcast + on-chain verified, ships) → `/onboard set-limit 0.10` → bot returns `CONFIRM-ONBOARD-XXXXXX` AND sends a 6-digit code to your phone via Twilio SMS → try `/onboard confirm <token>` without OTP → REJECTED ("a 6-digit SMS code was sent to your phone") → try with wrong OTP → REJECTED ("Incorrect code (1/5 attempts)") → confirm with the real OTP from SMS → applied. Then `/restock` halts with `CONFIRM-RESTOCK-XXXXXX` because $0.50 > $0.10 → try paraphrase "yes do it" → REJECTED → confirm with the literal token → proceeds → `/onboard set-limit 5 + OTP` → back to baseline. **(Categories: x402 integrity GREEN, guardrails GREEN with two-factor.)**
 6. **Identity (10 sec)** — show https://8004scan.io/agents/goat/29 — agent registered on mainnet.
 
 ---
@@ -369,9 +387,44 @@ Before resuming, **diff those files against this context** and reconcile. The ha
 - [x] Voice integration live
 - [x] A2A procurement live with real on-chain settlement
 - [x] `/onboard` configuration with literal-token guardrails + audit log
+- [x] SMS OTP two-factor on `/onboard` writes (Twilio, 10-min TTL, 5-attempt lockout)
 - [x] GitHub repo pushed (`Aarya2004/ClawClinic`)
 - [ ] Submit https://bit.ly/openclaw-hackathon-submission
 - [ ] Rehearse the 3-min demo end-to-end at least twice
-- [ ] Confirm Telegram, voice, ngrok, PharmaSupply server, and Hermes gateway are all up before the demo
+- [ ] Rotate the Twilio Auth Token via the Twilio console + update `~/.hermes/.env` + `hermes gateway restart`
+
+### Pre-demo readiness check (~30 sec to run)
+
+```bash
+# 1. Hermes gateway up and api-server listening
+curl -s http://127.0.0.1:8642/health
+# 2. Voice proxy + ngrok tunnel up
+curl -s http://127.0.0.1:8643/health
+curl -s http://127.0.0.1:4040/api/tunnels | python3 -c "import sys,json;[print(t['public_url']) for t in json.load(sys.stdin)['tunnels']]"
+# 3. PharmaSupply up
+curl -s http://127.0.0.1:8645/health
+# 4. Telegram bot answers
+#   (send /menu in the Telegram chat)
+# 5. Inventory low enough for /restock to demo
+python3 /Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/procurement/procurement_client.py inventory
+# 6. Wallet funds — need ~5x the per-restock cost in USDC.e + some BTC for gas
+( cd /Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/.claude/skills/evm-wallet-skill && \
+  node src/balance.js goat 0x3022b87ac063DE95b1570F46f5e470F8B53112D8 --json | python3 -c "import sys,json;d=json.load(sys.stdin);print('USDC.e:',d['balance'])" )
+# 7. SMS plumbing — send a test SMS
+python3 -c "
+import os, urllib.request, urllib.parse, base64, json
+for line in open('/Users/aaryaprakash/.hermes/.env'):
+    if '=' in line and not line.startswith('#'):
+        k,_,v=line.partition('='); os.environ.setdefault(k.strip(), v.strip())
+sid=os.environ['TWILIO_ACCOUNT_SID']; tok=os.environ['TWILIO_AUTH_TOKEN']
+req=urllib.request.Request(
+  f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json',
+  data=urllib.parse.urlencode({'From':'+16477244594','To':'+16478590120','Body':'ClawClinic readiness check.'}).encode(),
+  headers={'Authorization':'Basic '+base64.b64encode(f\"{sid}:{tok}\".encode()).decode(),'Content-Type':'application/x-www-form-urlencoded'}, method='POST')
+print(json.load(urllib.request.urlopen(req,timeout=15)).get('status'))
+"
+```
+
+If `sms_required=true` and Twilio is down, you are locked out of `/onboard` writes. To recover, edit `procurement/clinic_config.json` directly to set `operator.sms_required: false`, restart the gateway, and propose `/onboard set-operator-sms-required false` for the proper audit trail.
 
 The submission is the only hard wall. Everything else is upside.
