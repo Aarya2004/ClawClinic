@@ -1,6 +1,10 @@
 .pharmasupply-wallet.json
 pharmasupply_invoices.json
 .pending_restocks.json
+clinic_config.json
+.onboard_proposals.json
+.spend_ledger.json
+.onboard_audit.log
 *.log
 __pycache__/
 *.pyc

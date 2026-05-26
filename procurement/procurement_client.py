@@ -40,7 +40,52 @@ PENDING_PATH = os.path.join(HERE, ".pending_restocks.json")
 PHARMASUPPLY_URL = os.environ.get("PHARMASUPPLY_URL", "http://127.0.0.1:8645")
 GOAT_CHAIN_KEY = "goat"
 USDC_CONTRACT = "0x3022b87ac063DE95b1570F46f5e470F8B53112D8"
-AUTONOMOUS_LIMIT_USD = 5.00
+
+# Spending limits live in clinic_config.json so /onboard can change them at
+# runtime. Falls back to these defaults only if the config module fails to
+# import (e.g. running the client in isolation).
+DEFAULT_AUTONOMOUS_LIMIT_USD = 5.00
+DEFAULT_DAILY_CAP_USD = 50.00
+
+try:
+    import clinic_config as _clinic_config
+except Exception:  # noqa: BLE001
+    _clinic_config = None
+
+
+def autonomous_limit_usd() -> float:
+    if _clinic_config is not None:
+        try:
+            return float(_clinic_config.autonomous_limit_usd())
+        except Exception:  # noqa: BLE001
+            pass
+    return DEFAULT_AUTONOMOUS_LIMIT_USD
+
+
+def daily_cap_usd() -> float:
+    if _clinic_config is not None:
+        try:
+            return float(_clinic_config.daily_cap_usd())
+        except Exception:  # noqa: BLE001
+            pass
+    return DEFAULT_DAILY_CAP_USD
+
+
+def spend_last_24h_usd() -> float:
+    if _clinic_config is not None:
+        try:
+            return float(_clinic_config.spend_last_24h())
+        except Exception:  # noqa: BLE001
+            pass
+    return 0.0
+
+
+def record_spend(amount_usd: float, tx_hash: str, sku: str) -> None:
+    if _clinic_config is not None:
+        try:
+            _clinic_config.record_spend(amount_usd, tx_hash, sku)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------- Inventory ----------
@@ -177,8 +222,8 @@ def fmt_restock_report(report: dict) -> str:
     elif report.get("requires_confirmation"):
         lines.append("")
         lines.append(
-            f"⚠️  Total spend ${report['total_usd']:.2f} exceeds autonomous limit "
-            f"${AUTONOMOUS_LIMIT_USD:.2f}."
+            f"⚠️  Total spend ${report['total_usd']:.2f} exceeds the {report.get('limit_kind','autonomous')} limit "
+            f"${report.get('limit_usd', 0):.2f}."
         )
         lines.append(
             f"Reply with this exact token to proceed:  {report['confirmation_token']}"
@@ -222,22 +267,46 @@ def cmd_restock(confirm_token: str | None = None) -> int:
     report["total_usd"] = total
     pending = load_pending()
 
-    # Guardrail: require an explicit confirmation token if spend > limit
-    if total > AUTONOMOUS_LIMIT_USD:
+    # Snapshot guardrail limits at call time so the report shows what was in
+    # effect for this run.
+    limit_per_run = autonomous_limit_usd()
+    limit_daily = daily_cap_usd()
+    spent_24h = spend_last_24h_usd()
+    report["spent_last_24h_usd"] = spent_24h
+    report["autonomous_limit_usd"] = limit_per_run
+    report["daily_cap_usd"] = limit_daily
+
+    # Two stacked guardrails: per-restock and rolling 24h.
+    over_per_run = total > limit_per_run
+    over_daily = (spent_24h + total) > limit_daily
+
+    if over_per_run or over_daily:
+        limit_kind = "per-restock" if over_per_run else "rolling 24h"
+        limit_usd = limit_per_run if over_per_run else limit_daily
         if not confirm_token:
             token = f"CONFIRM-RESTOCK-{uuid.uuid4().hex[:6].upper()}"
             pending[token] = {
                 "plans": [{k: v for k, v in p.items() if k != "row"} for p in plans],
                 "total_usd": total,
+                "limit_kind": limit_kind,
+                "limit_usd": limit_usd,
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             save_pending(pending)
             report["requires_confirmation"] = True
             report["confirmation_token"] = token
-            report["steps"].append(
-                f"Planned spend ${total:.2f} exceeds autonomous limit "
-                f"(${AUTONOMOUS_LIMIT_USD:.2f}). Operator confirmation required."
-            )
+            report["limit_kind"] = limit_kind
+            report["limit_usd"] = limit_usd
+            if over_per_run:
+                report["steps"].append(
+                    f"Planned spend ${total:.2f} exceeds per-restock limit "
+                    f"(${limit_per_run:.2f}). Operator confirmation required."
+                )
+            else:
+                report["steps"].append(
+                    f"Planned spend ${total:.2f} on top of last 24h ${spent_24h:.2f} "
+                    f"would exceed daily cap (${limit_daily:.2f}). Operator confirmation required."
+                )
             print(fmt_restock_report(report))
             return 2  # not an error, just pending confirmation
         if confirm_token not in pending:
@@ -247,9 +316,14 @@ def cmd_restock(confirm_token: str | None = None) -> int:
         # Token consumed
         del pending[confirm_token]
         save_pending(pending)
+        report["steps"].append(
+            f"Operator confirmation token accepted. Proceeding with ${total:.2f} spend."
+        )
     else:
         report["steps"].append(
-            f"Total spend ${total:.2f} <= ${AUTONOMOUS_LIMIT_USD:.2f}. Proceeding autonomously."
+            f"Total spend ${total:.2f} ≤ per-restock ${limit_per_run:.2f} and "
+            f"24h cumulative ${spent_24h:.2f} + ${total:.2f} ≤ daily ${limit_daily:.2f}. "
+            "Proceeding autonomously."
         )
 
     # Execute each plan: quote -> pay -> settle -> update inventory
@@ -334,6 +408,9 @@ def cmd_restock(confirm_token: str | None = None) -> int:
             f"PharmaSupply confirmed payment: ${last_settle['amount_usd']:.2f} "
             f"settled in block {last_settle['block_number']}. Ships by {last_settle['ships_by']}."
         )
+
+        # Record into the rolling 24h spend ledger for the next guardrail check
+        record_spend(float(last_settle["amount_usd"]), tx_hash, sku)
 
         # Update inventory
         inv[sku]["on_hand"] = int(inv[sku]["on_hand"]) + qty * 100

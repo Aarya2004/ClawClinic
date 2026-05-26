@@ -1,0 +1,18 @@
+{
+  "clinic": {
+    "name": "Downtown Dental Toronto",
+    "hours": "Mon-Fri 8-6, Sat 9-2, closed Sun",
+    "address": "123 King Street West, Toronto, Ontario"
+  },
+  "spending": {
+    "autonomous_limit_usd": 5.00,
+    "daily_cap_usd": 50.00
+  },
+  "inventory_config": {
+    "FLU-TRAY-100": {
+      "name": "Fluoride trays (box of 100)",
+      "threshold": 20,
+      "unit_price_usd": 0.50
+    }
+  }
+}
