@@ -12,11 +12,25 @@ LLM handles per SOUL.md + the clawclinic skill.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import csv
 from pathlib import Path
 
 
 SKILL_DIR = Path.home() / ".hermes" / "skills" / "clawclinic"
 SLOTS_FILE = SKILL_DIR / "slots.json"
+
+# Procurement client lives in the ClawClinic repo. The plugin shells out to it
+# for /restock so the agent-to-agent flow stays out-of-process and out of the
+# Hermes turn-loop.
+PROCUREMENT_DIR = Path(
+    "/Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/procurement"
+)
+PROCUREMENT_CLIENT = PROCUREMENT_DIR / "procurement_client.py"
+VOICE_BOOKINGS_CSV = Path(
+    "/Users/aaryaprakash/Development/random_projs/GOAT-Hackathon-2026/voice/bookings.csv"
+)
 
 TESTNET_AGENT_ID = 304
 MAINNET_AGENT_ID = 29
@@ -35,9 +49,12 @@ def _menu(args: str = "") -> str:
         "/insurance Sun Life - Check a named insurance provider\n"
         "/hours - Clinic hours and address\n"
         "/cancel - Cancel one booking or trigger guarded bulk cancellation\n"
+        "/lookup BK-XXXXXXXX - Look up a booking from voice or Telegram\n"
         "/refill - Start a prescription refill request\n"
+        "/restock - Autonomous supply restock via PharmaSupply (A2A x402)\n"
+        "/onboard - View or change clinic configuration (spending limits, inventory, hours)\n"
         "/identity - Show ERC-8004 identity, wallet, and registry link\n\n"
-        "High-risk actions require literal confirmations. Example: CONFIRM CANCEL ALL."
+        "High-risk actions require literal confirmations. Examples: CONFIRM CANCEL ALL, CONFIRM-ONBOARD-XXXXXX."
     )
 
 
@@ -54,7 +71,10 @@ def _install_telegram_menu_override() -> None:
             ("insurance", "Check accepted insurance"),
             ("hours", "Clinic hours and address"),
             ("cancel", "Cancel an appointment"),
+            ("lookup", "Look up a booking by confirmation"),
             ("refill", "Request a prescription refill"),
+            ("restock", "Autonomous A2A supply restock"),
+            ("onboard", "Configure clinic limits and inventory"),
             ("identity", "Verify ERC-8004 identity"),
             ("menu", "Show ClawClinic commands"),
         ]
@@ -164,6 +184,41 @@ def _cancel(args: str) -> str:
     )
 
 
+def _format_booking(row: dict) -> str:
+    status = (row.get("status") or "unknown").strip()
+    confirmation = (row.get("confirmation") or "BK-UNKNOWN").strip()
+    return (
+        f"📋 Booking {confirmation}\n"
+        f"  Status:  {status}\n"
+        f"  Time:    {row.get('slot_start','?')} to {row.get('slot_end','?')}\n"
+        f"  Service: {row.get('service','?')}\n"
+        f"  Patient: {row.get('patient_name','?')}\n"
+        f"  Phone:   {row.get('caller_id') or 'not captured'}"
+    )
+
+
+def _lookup_booking(confirmation: str) -> str:
+    needle = confirmation.strip().upper().replace("_", "-")
+    if not needle:
+        return "Usage: /lookup BK-XXXXXXXX"
+    if not needle.startswith("BK-"):
+        needle = f"BK-{needle}"
+    if not VOICE_BOOKINGS_CSV.exists():
+        return (
+            "No shared booking history is available yet.\n"
+            f"I looked for {VOICE_BOOKINGS_CSV}."
+        )
+    with VOICE_BOOKINGS_CSV.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("confirmation") or "").strip().upper() == needle:
+                return _format_booking(row)
+    return f"I couldn't find booking {needle} in the shared booking history."
+
+
+def _lookup(args: str) -> str:
+    return _lookup_booking(args)
+
+
 def _refill(args: str) -> str:
     rx = args.strip()
     if rx:
@@ -183,6 +238,285 @@ def _refill(args: str) -> str:
     )
 
 
+def _restock(args: str) -> str:
+    """Run the autonomous A2A procurement client.
+
+    Static handler: shells out to procurement_client.py and returns its full
+    output. The first argument, if it looks like CONFIRM-RESTOCK-XXXXXX, is
+    forwarded as the over-limit confirmation token.
+    """
+    if not PROCUREMENT_CLIENT.exists():
+        return (
+            "Restock is unavailable on this host.\n"
+            "(procurement_client.py not found at the configured path)"
+        )
+
+    cmd = ["python3", str(PROCUREMENT_CLIENT), "restock"]
+    token = args.strip().split()[0] if args.strip() else ""
+    if token.upper().startswith("CONFIRM-RESTOCK-"):
+        cmd += ["--confirm-token", token]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(PROCUREMENT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=240,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "Restock timed out after 4 minutes.\n"
+            "The on-chain transfer may still have broadcast — check the explorer "
+            "before retrying."
+        )
+
+    body = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not body:
+        return f"Restock finished with exit code {proc.returncode} and no output."
+    return body[:3500]
+
+
+# ─── /onboard — clinic configuration with literal-token guardrails ─────
+
+def _load_clinic_config_module():
+    """Import the in-project clinic_config module on demand.
+
+    Kept lazy so a missing PROCUREMENT_DIR (e.g. someone else's checkout)
+    does not break the plugin import — /onboard just becomes unavailable.
+    """
+    import sys
+    if str(PROCUREMENT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROCUREMENT_DIR))
+    import importlib
+    try:
+        mod = importlib.import_module("clinic_config")
+        return importlib.reload(mod)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_ONBOARD_HELP = (
+    "🛠  ClawClinic onboarding — clinic configuration\n\n"
+    "Read (always safe):\n"
+    "  /onboard                       — show current config + 24h spend\n"
+    "  /onboard pending               — list pending confirmation tokens\n\n"
+    "Propose a change (returns a CONFIRM-ONBOARD-XXXXXX token):\n"
+    "  /onboard set-limit <usd>                    — per-restock autonomous limit\n"
+    "  /onboard set-daily <usd>                    — rolling 24h cumulative cap\n"
+    "  /onboard set-clinic name|hours|address <value>\n"
+    "  /onboard add-sku <SKU> <price> <threshold> <name…>\n"
+    "  /onboard remove-sku <SKU>\n"
+    "  /onboard reset                              — restore defaults\n\n"
+    "Confirm or abort a pending proposal:\n"
+    "  /onboard confirm <CONFIRM-ONBOARD-XXXXXX>\n"
+    "  /onboard abort   <CONFIRM-ONBOARD-XXXXXX>\n\n"
+    "Approximate confirmations (e.g. 'yes', 'do it') are rejected. "
+    "The literal token must match exactly."
+)
+
+
+def _onboard_show_config(mod) -> str:
+    cfg = mod.load_config()
+    spent = mod.spend_last_24h()
+    spending = cfg.get("spending", {})
+    clinic = cfg.get("clinic", {})
+    inv = cfg.get("inventory_config", {})
+
+    lines = ["🛠  ClawClinic configuration\n"]
+    lines.append("Clinic")
+    lines.append(f"  name:    {clinic.get('name','—')}")
+    lines.append(f"  hours:   {clinic.get('hours','—')}")
+    lines.append(f"  address: {clinic.get('address','—')}")
+    lines.append("")
+    lines.append("Spending")
+    lines.append(f"  per-restock autonomous limit: ${float(spending.get('autonomous_limit_usd',0)):.2f}")
+    lines.append(f"  rolling 24h cumulative cap:   ${float(spending.get('daily_cap_usd',0)):.2f}")
+    lines.append(f"  spent in last 24h:            ${spent:.2f}")
+    lines.append("")
+    lines.append("Inventory (thresholds + supplier prices)")
+    if not inv:
+        lines.append("  (none configured)")
+    else:
+        for sku, row in inv.items():
+            lines.append(
+                f"  {sku}: {row.get('name','?')} — threshold {row.get('threshold','?')}"
+                f" @ ${float(row.get('unit_price_usd',0)):.2f}"
+            )
+    lines.append("")
+    pending = mod.list_proposals()
+    if pending:
+        lines.append(f"⏳ Pending proposals: {len(pending)} (run /onboard pending)")
+    else:
+        lines.append("⏳ No pending proposals.")
+    return "\n".join(lines)
+
+
+def _onboard_show_pending(mod) -> str:
+    pending = mod.list_proposals()
+    if not pending:
+        return "No pending proposals."
+    lines = ["⏳ Pending proposals\n"]
+    for token, prop in pending.items():
+        lines.append(f"  {token}")
+        lines.append(f"    action:  {prop.get('action')}")
+        lines.append(f"    payload: {prop.get('payload')}")
+        lines.append(f"    created: {prop.get('created_at')}")
+        lines.append("")
+    lines.append(
+        "Apply with /onboard confirm <TOKEN>, or discard with /onboard abort <TOKEN>."
+    )
+    return "\n".join(lines)
+
+
+def _onboard_apply_or_abort(mod, action: str, token: str) -> str:
+    token = token.strip()
+    if not token.startswith("CONFIRM-ONBOARD-"):
+        return (
+            "❌ That is not a valid confirmation token. Tokens look like "
+            "CONFIRM-ONBOARD-AB12CD and are emitted by a propose command."
+        )
+    if action == "abort":
+        ok = mod.abort_proposal(token)
+        return f"✅ Proposal {token} aborted." if ok else f"❌ No pending proposal {token}."
+    ok, msg, payload = mod.apply_proposal(token)
+    if not ok:
+        return f"❌ {msg}"
+    return f"✅ {msg} ({payload})"
+
+
+def _onboard_propose_set_limit(mod, args: list, field: str) -> str:
+    if len(args) != 1:
+        return f"Usage: /onboard set-{field.split('_')[0]} <usd>"
+    try:
+        value = float(args[0])
+    except ValueError:
+        return f"❌ Could not parse {args[0]!r} as a USD amount."
+    err = mod.validate_spending(field, value)
+    if err:
+        return f"❌ {err}"
+    token = mod.propose_change("set_spending", {"field": field, "value": value})
+    current = float(mod.load_config().get("spending", {}).get(field, 0))
+    return (
+        f"📝 Proposed: change {field} from ${current:.2f} → ${value:.2f}.\n\n"
+        f"To apply:  /onboard confirm {token}\n"
+        f"To abort:  /onboard abort {token}"
+    )
+
+
+def _onboard_propose_set_clinic(mod, args: list) -> str:
+    if len(args) < 2:
+        return "Usage: /onboard set-clinic name|hours|address <value…>"
+    field = args[0].lower()
+    value = " ".join(args[1:]).strip()
+    err = mod.validate_clinic(field, value)
+    if err:
+        return f"❌ {err}"
+    token = mod.propose_change("set_clinic_field", {"field": field, "value": value})
+    return (
+        f"📝 Proposed: set clinic.{field} = {value!r}.\n\n"
+        f"To apply:  /onboard confirm {token}\n"
+        f"To abort:  /onboard abort {token}"
+    )
+
+
+def _onboard_propose_add_sku(mod, args: list) -> str:
+    # Usage: /onboard add-sku <SKU> <price> <threshold> <name words…>
+    if len(args) < 4:
+        return "Usage: /onboard add-sku <SKU> <unit_price_usd> <threshold> <name…>"
+    sku = args[0].strip().upper()
+    try:
+        price = float(args[1])
+        threshold = int(args[2])
+    except ValueError:
+        return "❌ Price must be a number and threshold must be an integer."
+    name = " ".join(args[3:]).strip()
+    err = mod.validate_add_sku(sku, name, price, threshold)
+    if err:
+        return f"❌ {err}"
+    token = mod.propose_change(
+        "add_sku",
+        {"sku": sku, "name": name, "unit_price_usd": price, "threshold": threshold},
+    )
+    return (
+        f"📝 Proposed: add SKU {sku} ({name}) @ ${price:.2f}, threshold {threshold}.\n\n"
+        f"To apply:  /onboard confirm {token}\n"
+        f"To abort:  /onboard abort {token}"
+    )
+
+
+def _onboard_propose_remove_sku(mod, args: list) -> str:
+    if len(args) != 1:
+        return "Usage: /onboard remove-sku <SKU>"
+    sku = args[0].strip().upper()
+    cfg = mod.load_config()
+    if sku not in cfg.get("inventory_config", {}):
+        return f"❌ SKU {sku} is not in the current inventory config."
+    token = mod.propose_change("remove_sku", {"sku": sku})
+    return (
+        f"📝 Proposed: remove SKU {sku}.\n\n"
+        f"To apply:  /onboard confirm {token}\n"
+        f"To abort:  /onboard abort {token}"
+    )
+
+
+def _onboard_propose_reset(mod) -> str:
+    token = mod.propose_change("reset", {})
+    return (
+        "📝 Proposed: reset clinic configuration to defaults.\n\n"
+        f"To apply:  /onboard confirm {token}\n"
+        f"To abort:  /onboard abort {token}"
+    )
+
+
+def _onboard(args: str) -> str:
+    """Strict-allowlist dispatcher. Unknown sub-actions return the help menu."""
+    mod = _load_clinic_config_module()
+    if mod is None:
+        return (
+            "Onboarding is unavailable on this host.\n"
+            "(clinic_config module could not be loaded from the procurement repo)"
+        )
+
+    parts = (args or "").strip().split()
+    if not parts:
+        return _onboard_show_config(mod)
+
+    head = parts[0].lower()
+    rest = parts[1:]
+
+    if head in {"help", "menu", "?"}:
+        return _ONBOARD_HELP
+    if head == "pending":
+        return _onboard_show_pending(mod)
+    if head == "confirm":
+        if not rest:
+            return "❌ Usage: /onboard confirm <CONFIRM-ONBOARD-XXXXXX>"
+        return _onboard_apply_or_abort(mod, "confirm", rest[0])
+    if head == "abort":
+        if not rest:
+            return "❌ Usage: /onboard abort <CONFIRM-ONBOARD-XXXXXX>"
+        return _onboard_apply_or_abort(mod, "abort", rest[0])
+    if head == "set-limit":
+        return _onboard_propose_set_limit(mod, rest, "autonomous_limit_usd")
+    if head == "set-daily":
+        return _onboard_propose_set_limit(mod, rest, "daily_cap_usd")
+    if head == "set-clinic":
+        return _onboard_propose_set_clinic(mod, rest)
+    if head == "add-sku":
+        return _onboard_propose_add_sku(mod, rest)
+    if head == "remove-sku":
+        return _onboard_propose_remove_sku(mod, rest)
+    if head == "reset":
+        return _onboard_propose_reset(mod)
+
+    return (
+        f"❌ Unknown /onboard sub-action: {head!r}.\n\n"
+        + _ONBOARD_HELP
+    )
+
+
 # ─── registration ──────────────────────────────────────────────────────
 
 def register(ctx) -> None:
@@ -193,4 +527,7 @@ def register(ctx) -> None:
     ctx.register_command("identity",  handler=_identity,  description="Show ClawClinic's on-chain identity (ERC-8004)")
     ctx.register_command("book",      handler=_book,      description="Request an appointment at the clinic")
     ctx.register_command("cancel",    handler=_cancel,    description="Cancel an appointment")
+    ctx.register_command("lookup",    handler=_lookup,    description="Look up a booking by confirmation number")
     ctx.register_command("refill",    handler=_refill,    description="Request a prescription refill")
+    ctx.register_command("restock",   handler=_restock,   description="Autonomous A2A supply restock via PharmaSupply")
+    ctx.register_command("onboard",   handler=_onboard,   description="Configure clinic spending limits, inventory, and facts (with literal-token guardrails)")

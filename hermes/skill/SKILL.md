@@ -1,6 +1,6 @@
 ---
 name: clawclinic
-description: "ClawClinic booking + x402 payment flow on GOAT Mainnet. Use for /book, /cancel, /hours, /insurance, /refill, /identity."
+description: "ClawClinic booking + x402 payment flow on GOAT Mainnet. Use for /book, /cancel, /hours, /insurance, /refill, /restock, /onboard, /identity."
 version: 1.0.0
 platforms: [linux, macos]
 metadata:
@@ -27,7 +27,7 @@ SKILL_DIR=/Users/aaryaprakash/.hermes/skills/clawclinic
 ## Command behaviors
 
 Only these ClawClinic commands should be available in the Telegram bot:
-`/book`, `/insurance`, `/hours`, `/cancel`, `/refill`, `/identity`, `/menu`, `/help`, `/commands`.
+`/book`, `/insurance`, `/hours`, `/cancel`, `/refill`, `/restock`, `/onboard`, `/identity`, `/menu`, `/help`, `/commands`.
 Other installed Hermes skill commands are out of scope and should be rejected as unavailable in ClawClinic mode.
 
 ### hours
