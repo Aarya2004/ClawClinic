@@ -25,6 +25,7 @@ See README.md for ElevenLabs configuration.
 """
 
 import csv
+from collections import defaultdict, deque
 import json
 import os
 import queue
@@ -68,6 +69,25 @@ SERVICE_DURATIONS_MIN = {
 }
 DEFAULT_DURATION_MIN = 30
 
+MAX_BODY_BYTES = 256 * 1024
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMITS = {
+    "chat": 90,
+    "tool": 180,
+    "read": 240,
+}
+
+BOOKINGS_LOCK = threading.RLock()
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+
+
+class RequestError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
 
 def parse_iso(s: str):
     """Parse ISO 8601. Accept trailing 'Z' as UTC. Returns datetime or None."""
@@ -88,27 +108,38 @@ def service_duration_min(service: str) -> int:
 
 
 def append_booking(row: dict) -> None:
-    new_file = not os.path.exists(BOOKINGS_CSV)
-    with open(BOOKINGS_CSV, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=BOOKING_FIELDS)
-        if new_file:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in BOOKING_FIELDS})
+    with BOOKINGS_LOCK:
+        os.makedirs(os.path.dirname(BOOKINGS_CSV), exist_ok=True)
+        new_file = not os.path.exists(BOOKINGS_CSV)
+        with open(BOOKINGS_CSV, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=BOOKING_FIELDS)
+            if new_file:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in BOOKING_FIELDS})
 
 
 def read_all_bookings() -> list:
-    if not os.path.exists(BOOKINGS_CSV):
-        return []
-    with open(BOOKINGS_CSV, newline="") as f:
-        return list(csv.DictReader(f))
+    with BOOKINGS_LOCK:
+        if not os.path.exists(BOOKINGS_CSV):
+            return []
+        try:
+            with open(BOOKINGS_CSV, newline="") as f:
+                return list(csv.DictReader(f))
+        except (OSError, csv.Error) as e:
+            print(f"[booking] read error: {e}", flush=True)
+            return []
 
 
 def write_all_bookings(rows: list) -> None:
-    with open(BOOKINGS_CSV, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=BOOKING_FIELDS)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in BOOKING_FIELDS})
+    with BOOKINGS_LOCK:
+        os.makedirs(os.path.dirname(BOOKINGS_CSV), exist_ok=True)
+        tmp = BOOKINGS_CSV + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=BOOKING_FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in BOOKING_FIELDS})
+        os.replace(tmp, BOOKINGS_CSV)
 
 
 def make_confirmation() -> str:
@@ -219,25 +250,80 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _endpoint_kind(self, path: str) -> str:
+        if path == "/v1/chat/completions":
+            return "chat"
+        if path in ("/book", "/appointment_status"):
+            return "tool"
+        return "read"
+
+    def _rate_limited(self, path: str) -> bool:
+        if path in ("/health", "/v1/health"):
+            return False
+        kind = self._endpoint_kind(path)
+        limit = RATE_LIMITS[kind]
+        key = (self.client_address[0], kind)
+        now = time.monotonic()
+        cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+        with RATE_LIMIT_LOCK:
+            bucket = RATE_LIMIT_BUCKETS[key]
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= limit:
+                return True
+            bucket.append(now)
+        return False
+
+    def _read_json_body(self) -> dict:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            raise RequestError(411, "Invalid Content-Length")
+        if length < 0:
+            raise RequestError(411, "Invalid Content-Length")
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True
+            raise RequestError(413, "Request body is too large")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw or b"{}")
+        except Exception as e:
+            raise RequestError(400, "Invalid JSON") from e
+        if not isinstance(payload, dict):
+            raise RequestError(400, "JSON body must be an object")
+        return payload
+
+    def _safe_json_error(self, status: int, message: str) -> None:
+        try:
+            self._json(status, {"ok": False, "error": message})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            print(f"[proxy] unhandled GET error: {e}", flush=True)
+            self._safe_json_error(500, "internal error")
+
+    def _do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if self._rate_limited(path):
+            return self._json(429, {"ok": False, "error": "rate_limited"})
         if path in ("/health", "/v1/health"):
             return self._json(200, {"status": "ok", "proxy": "clawclinic-voice"})
         if path == "/bookings":
-            rows = []
-            if os.path.exists(BOOKINGS_CSV):
-                with open(BOOKINGS_CSV, newline="") as f:
-                    rows = list(csv.DictReader(f))
+            rows = read_all_bookings()
             return self._json(200, {"count": len(rows), "bookings": rows})
         self.send_error(404)
 
     def handle_booking(self):
         from datetime import timedelta
 
-        length = int(self.headers.get("Content-Length", "0"))
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
+            payload = self._read_json_body()
+        except RequestError:
             return self._json(
                 200,
                 {
@@ -287,11 +373,16 @@ class Handler(BaseHTTPRequestHandler):
         slot_start_iso = start.isoformat()
         slot_end_iso = end.isoformat()
 
-        # Overlap detection: existing.start < new.end AND existing.end > new.start
-        # Cancelled bookings free the slot.
-        if os.path.exists(BOOKINGS_CSV):
-            with open(BOOKINGS_CSV, newline="") as f:
-                for row in csv.DictReader(f):
+        with BOOKINGS_LOCK:
+            # Overlap detection: existing.start < new.end AND existing.end > new.start
+            # Cancelled bookings free the slot.
+            if os.path.exists(BOOKINGS_CSV):
+                try:
+                    existing_rows = read_all_bookings()
+                except Exception as e:
+                    print(f"[booking] overlap read error: {e}", flush=True)
+                    existing_rows = []
+                for row in existing_rows:
                     if (row.get("status") or "").lower() == "cancelled":
                         continue
                     ex_start = parse_iso(row.get("slot_start", ""))
@@ -314,19 +405,19 @@ class Handler(BaseHTTPRequestHandler):
                             },
                         )
 
-        confirmation = make_confirmation()
-        row = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "confirmation": confirmation,
-            "status": "booked",
-            "slot_start": slot_start_iso,
-            "slot_end": slot_end_iso,
-            "service": service,
-            "patient_name": name,
-            "caller_id": caller_id,
-            "notes": notes,
-        }
-        append_booking(row)
+            confirmation = make_confirmation()
+            row = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "confirmation": confirmation,
+                "status": "booked",
+                "slot_start": slot_start_iso,
+                "slot_end": slot_end_iso,
+                "service": service,
+                "patient_name": name,
+                "caller_id": caller_id,
+                "notes": notes,
+            }
+            append_booking(row)
         print(
             f"[booking] {confirmation} | {slot_start_iso} → {slot_end_iso} | "
             f"{service} | {name} | {caller_id}",
@@ -358,11 +449,10 @@ class Handler(BaseHTTPRequestHandler):
 
         Update mode requires `confirmation` + `new_status` ∈ VALID_STATUSES.
         """
-        length = int(self.headers.get("Content-Length", "0"))
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            return self._json(400, {"ok": False, "error": "bad json"})
+            payload = self._read_json_body()
+        except RequestError as e:
+            return self._json(e.status, {"ok": False, "error": e.message})
 
         confirmation = (payload.get("confirmation") or "").strip().upper()
         caller_id = (payload.get("caller_id") or "").strip()
@@ -381,62 +471,12 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
 
-        rows = read_all_bookings()
+        with BOOKINGS_LOCK:
+            rows = read_all_bookings()
 
-        # Update path always requires a confirmation
-        if new_status:
-            if not confirmation:
-                return self._json(
-                    200,
-                    {
-                        "ok": False,
-                        "error": "missing_confirmation",
-                        "message": "To change status I need the confirmation number.",
-                    },
-                )
-            if new_status not in VALID_STATUSES:
-                return self._json(
-                    200,
-                    {
-                        "ok": False,
-                        "error": "bad_status",
-                        "message": (
-                            "Status must be one of: "
-                            f"{', '.join(sorted(VALID_STATUSES))}."
-                        ),
-                    },
-                )
-            target = next(
-                (r for r in rows if (r.get("confirmation") or "").upper() == confirmation),
-                None,
-            )
-            if target is None:
-                return self._json(
-                    200,
-                    {
-                        "ok": False,
-                        "error": "not_found",
-                        "confirmation": confirmation,
-                        "message": f"No booking found for {confirmation}.",
-                    },
-                )
-            old_status = target.get("status") or "booked"
-            target["status"] = new_status
-            write_all_bookings(rows)
-            print(
-                f"[booking] {confirmation} status {old_status} -> {new_status}",
-                flush=True,
-            )
-            return self._json(
-                200,
-                {
-                    "ok": True,
-                    "confirmation": confirmation,
-                    "old_status": old_status,
-                    "status": new_status,
-                    "message": f"Appointment {confirmation} updated to {new_status}.",
-                },
-            )
+            # Update path always requires a confirmation
+            if new_status:
+                return self._handle_status_update(rows, confirmation, new_status)
 
         # Lookup by confirmation — single row
         if confirmation:
@@ -485,8 +525,73 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_status_update(self, rows: list, confirmation: str, new_status: str):
+        if not confirmation:
+            return self._json(
+                200,
+                {
+                    "ok": False,
+                    "error": "missing_confirmation",
+                    "message": "To change status I need the confirmation number.",
+                },
+            )
+        if new_status not in VALID_STATUSES:
+            return self._json(
+                200,
+                {
+                    "ok": False,
+                    "error": "bad_status",
+                    "message": (
+                        "Status must be one of: "
+                        f"{', '.join(sorted(VALID_STATUSES))}."
+                    ),
+                },
+            )
+        target = next(
+            (r for r in rows if (r.get("confirmation") or "").upper() == confirmation),
+            None,
+        )
+        if target is None:
+            return self._json(
+                200,
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "confirmation": confirmation,
+                    "message": f"No booking found for {confirmation}.",
+                },
+            )
+        old_status = target.get("status") or "booked"
+        target["status"] = new_status
+        write_all_bookings(rows)
+        print(
+            f"[booking] {confirmation} status {old_status} -> {new_status}",
+            flush=True,
+        )
+        return self._json(
+            200,
+            {
+                "ok": True,
+                "confirmation": confirmation,
+                "old_status": old_status,
+                "status": new_status,
+                "message": f"Appointment {confirmation} updated to {new_status}.",
+            },
+        )
+
     def do_POST(self):
+        try:
+            self._do_POST()
+        except RequestError as e:
+            self._safe_json_error(e.status, e.message)
+        except Exception as e:
+            print(f"[proxy] unhandled POST error: {e}", flush=True)
+            self._safe_json_error(500, "internal error")
+
+    def _do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if self._rate_limited(path):
+            return self._json(429, {"ok": False, "error": "rate_limited"})
         if path == "/book":
             return self.handle_booking()
         if path == "/appointment_status":
@@ -495,13 +600,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length else b""
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            self.send_error(400, "bad json")
-            return
+        payload = self._read_json_body()
 
         auth = self.headers.get("Authorization", "")
         payload["stream"] = True
@@ -509,7 +608,12 @@ class Handler(BaseHTTPRequestHandler):
         # Replace ElevenLabs' generic "You are an AI agent..." system message
         # with the ClawClinic persona. Keep all non-system messages intact.
         msgs = payload.get("messages") or []
-        non_system = [m for m in msgs if m.get("role") != "system"]
+        if not isinstance(msgs, list):
+            msgs = []
+        non_system = [
+            m for m in msgs
+            if isinstance(m, dict) and m.get("role") != "system"
+        ]
         payload["messages"] = [{"role": "system", "content": CLAWCLINIC_SYSTEM}] + non_system
 
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

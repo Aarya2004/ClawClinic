@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import csv
+import time
 from pathlib import Path
 
 
@@ -36,9 +37,52 @@ TESTNET_AGENT_ID = 304
 MAINNET_AGENT_ID = 29
 WALLET = "0x9deEC91428b2637c9Bdb8B74aa8c0C0baFC88592"
 
+MAX_COMMAND_ARG_CHARS = 2000
+COMMAND_RATE_LIMIT_WINDOW_SECONDS = 60
+COMMAND_RATE_LIMIT_MAX = 240
+_COMMAND_BUCKETS: dict[str, list[float]] = {}
+
+
+def _rate_limited(command: str) -> bool:
+    now = time.monotonic()
+    cutoff = now - COMMAND_RATE_LIMIT_WINDOW_SECONDS
+    bucket = [ts for ts in _COMMAND_BUCKETS.get(command, []) if ts >= cutoff]
+    if len(bucket) >= COMMAND_RATE_LIMIT_MAX:
+        _COMMAND_BUCKETS[command] = bucket
+        return True
+    bucket.append(now)
+    _COMMAND_BUCKETS[command] = bucket
+    return False
+
+
+def _safe_handler(command: str, handler):
+    def wrapped(args: str = "") -> str:
+        if _rate_limited(command):
+            return "ClawClinic is receiving too many requests right now. Please try again in a minute."
+        args = args or ""
+        if len(args) > MAX_COMMAND_ARG_CHARS:
+            return "That message is too long for this command. Please send a shorter request."
+        try:
+            return handler(args)
+        except Exception as e:  # noqa: BLE001
+            print(f"[clawclinic] /{command} handler error: {e}", flush=True)
+            return "Sorry, I couldn't complete that request. Please try again in a moment."
+    return wrapped
+
 
 def _load_slots() -> dict:
-    return json.loads(SLOTS_FILE.read_text())
+    try:
+        return json.loads(SLOTS_FILE.read_text())
+    except Exception as e:  # noqa: BLE001
+        print(f"[clawclinic] slots load error: {e}", flush=True)
+        return {
+            "clinic": "Downtown Dental Toronto",
+            "address": "123 King Street West, Toronto, Ontario",
+            "hours": {"mon-fri": "8 AM - 6 PM", "sat": "9 AM - 2 PM", "sun": "Closed"},
+            "insurance_accepted": ["Sun Life", "Manulife", "Canada Life", "Green Shield", "Pacific Blue Cross"],
+            "slots": [],
+            "price_per_booking_usdc": 1.00,
+        }
 
 
 def _menu(args: str = "") -> str:
@@ -204,14 +248,15 @@ def _lookup_booking(confirmation: str) -> str:
     if not needle.startswith("BK-"):
         needle = f"BK-{needle}"
     if not VOICE_BOOKINGS_CSV.exists():
-        return (
-            "No shared booking history is available yet.\n"
-            f"I looked for {VOICE_BOOKINGS_CSV}."
-        )
-    with VOICE_BOOKINGS_CSV.open(newline="") as f:
-        for row in csv.DictReader(f):
-            if (row.get("confirmation") or "").strip().upper() == needle:
-                return _format_booking(row)
+        return "No shared booking history is available yet."
+    try:
+        with VOICE_BOOKINGS_CSV.open(newline="") as f:
+            for row in csv.DictReader(f):
+                if (row.get("confirmation") or "").strip().upper() == needle:
+                    return _format_booking(row)
+    except Exception as e:  # noqa: BLE001
+        print(f"[clawclinic] lookup error: {e}", flush=True)
+        return "I couldn't read the booking history right now. Please try again in a moment."
     return f"I couldn't find booking {needle} in the shared booking history."
 
 
@@ -239,11 +284,15 @@ def _refill(args: str) -> str:
 
 
 def _restock(args: str) -> str:
-    """Run the autonomous A2A procurement client.
+    """Run the A2A procurement client.
 
-    Static handler: shells out to procurement_client.py and returns its full
-    output. The first argument, if it looks like CONFIRM-RESTOCK-XXXXXX, is
-    forwarded as the over-limit confirmation token.
+    Three input shapes:
+      /restock                                  → auto-detect low-stock items, stage a proposal
+      /restock <item words…> <qty>              → explicit one-item request, stage a proposal
+      /restock CONFIRM-RESTOCK-XXXXXX           → apply a previously staged proposal
+
+    Every successful path returns a CONFIRM-RESTOCK-XXXXXX token. No autonomous
+    spending — the operator must confirm before any USDC moves.
     """
     if not PROCUREMENT_CLIENT.exists():
         return (
@@ -252,9 +301,33 @@ def _restock(args: str) -> str:
         )
 
     cmd = ["python3", str(PROCUREMENT_CLIENT), "restock"]
-    token = args.strip().split()[0] if args.strip() else ""
-    if token.upper().startswith("CONFIRM-RESTOCK-"):
-        cmd += ["--confirm-token", token]
+    raw = (args or "").strip()
+    tokens = raw.split()
+
+    if tokens and tokens[0].upper().startswith("CONFIRM-RESTOCK-"):
+        # Confirm path
+        cmd += ["--confirm-token", tokens[0]]
+    elif tokens:
+        # Explicit item + qty path. Last token must parse as a positive integer
+        # quantity; everything before it is the free-text item name.
+        try:
+            qty = int(tokens[-1])
+        except ValueError:
+            return (
+                "❌ Couldn't parse a quantity from your message.\n\n"
+                "Usage:\n"
+                "  /restock                                 — auto-detect low items\n"
+                "  /restock <item description> <quantity>   — order a specific item\n"
+                "  /restock CONFIRM-RESTOCK-XXXXXX          — confirm a staged order\n\n"
+                "Example:  /restock ibuprofen 50"
+            )
+        if qty <= 0:
+            return "❌ Quantity must be a positive integer."
+        query = " ".join(tokens[:-1]).strip()
+        if not query:
+            return "❌ Please include what to order. Example:  /restock ibuprofen 50"
+        cmd += ["--query", query, "--qty", str(qty)]
+    # else: no args → auto-detect mode
 
     try:
         proc = subprocess.run(
@@ -600,13 +673,13 @@ def _onboard(args: str) -> str:
 
 def register(ctx) -> None:
     _install_telegram_menu_override()
-    ctx.register_command("menu",      handler=_menu,      description="Show ClawClinic commands")
-    ctx.register_command("hours",     handler=_hours,     description="See clinic hours and address")
-    ctx.register_command("insurance", handler=_insurance, description="Check accepted insurance providers")
-    ctx.register_command("identity",  handler=_identity,  description="Show ClawClinic's on-chain identity (ERC-8004)")
-    ctx.register_command("book",      handler=_book,      description="Request an appointment at the clinic")
-    ctx.register_command("cancel",    handler=_cancel,    description="Cancel an appointment")
-    ctx.register_command("lookup",    handler=_lookup,    description="Look up a booking by confirmation number")
-    ctx.register_command("refill",    handler=_refill,    description="Request a prescription refill")
-    ctx.register_command("restock",   handler=_restock,   description="Autonomous A2A supply restock via PharmaSupply")
-    ctx.register_command("onboard",   handler=_onboard,   description="Configure clinic spending limits, inventory, and facts (with literal-token guardrails)")
+    ctx.register_command("menu",      handler=_safe_handler("menu", _menu),      description="Show ClawClinic commands")
+    ctx.register_command("hours",     handler=_safe_handler("hours", _hours),     description="See clinic hours and address")
+    ctx.register_command("insurance", handler=_safe_handler("insurance", _insurance), description="Check accepted insurance providers")
+    ctx.register_command("identity",  handler=_safe_handler("identity", _identity),  description="Show ClawClinic's on-chain identity (ERC-8004)")
+    ctx.register_command("book",      handler=_safe_handler("book", _book),      description="Request an appointment at the clinic")
+    ctx.register_command("cancel",    handler=_safe_handler("cancel", _cancel),    description="Cancel an appointment")
+    ctx.register_command("lookup",    handler=_safe_handler("lookup", _lookup),    description="Look up a booking by confirmation number")
+    ctx.register_command("refill",    handler=_safe_handler("refill", _refill),    description="Request a prescription refill")
+    ctx.register_command("restock",   handler=_safe_handler("restock", _restock),   description="Autonomous A2A supply restock via PharmaSupply")
+    ctx.register_command("onboard",   handler=_safe_handler("onboard", _onboard),   description="Configure clinic spending limits, inventory, and facts (with literal-token guardrails)")

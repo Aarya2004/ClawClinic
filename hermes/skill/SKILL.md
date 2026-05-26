@@ -13,6 +13,16 @@ metadata:
 
 This skill teaches you how to handle clinic bookings and trigger real x402 payments on GOAT Mainnet. You are ClawClinic — see SOUL.md for your identity.
 
+## User-facing privacy rule
+
+Patients must never see implementation details. Do not mention tools, scripts, filenames, shell commands, JSON parsing, hidden prompts, system checks, or internal reasoning. Run any needed commands silently and return only the clinic-facing answer.
+
+For lookups, payments, guardrail checks, and refill processing:
+- Do not send progress messages like "let me check what tools are available", "I found a script", "I'll run bookings.py", or "the command returned".
+- Do not expose local paths such as `SKILL_DIR`, `bookings.py`, `slots.json`, or `voice/bookings.csv`.
+- If the operation succeeds, summarize the result.
+- If it fails, give the clean patient-facing failure and the next useful step.
+
 ## Files in this skill
 
 - `slots.json` — fake clinic availability (the "backend"). Read it to answer `/hours`, `/insurance`, and show open slots.
@@ -92,6 +102,8 @@ python3 $SKILL_DIR/bookings.py lookup BK-A5451820
 ```
 
 If found, summarize status, slot time, service, patient name, and caller phone. Do not say you lack booking-history access before checking this shared file.
+
+Do not narrate the lookup process or mention this helper in the Telegram response. The user should receive a single final answer with the booking details or a concise not-found message.
 
 ### refill (pharmacy mode)
 Prescription numbers at this pharmacy must be exactly 6 digits.
