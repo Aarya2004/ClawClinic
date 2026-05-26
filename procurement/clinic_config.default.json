@@ -8,6 +8,10 @@
     "autonomous_limit_usd": 5.00,
     "daily_cap_usd": 50.00
   },
+  "operator": {
+    "phone_e164": "+16478590120",
+    "sms_required": false
+  },
   "inventory_config": {
     "FLU-TRAY-100": {
       "name": "Fluoride trays (box of 100)",
