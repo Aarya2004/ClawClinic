@@ -125,7 +125,8 @@ curl -s http://127.0.0.1:8643/bookings | python3 -m json.tool
 ## Tuning
 
 In `voice_proxy.py`:
-- `FILLER_AFTER_SECONDS` — `0` disables the filler entirely; set to `4.0` to only speak a filler on slow turns.
+- `FILLER_PROBABILITY` — chance of speaking one filler on a slow turn; `0` disables it.
+- `FILLER_DELAY_RANGE_SECONDS` — random delay window before the filler is used.
 - `CLAWCLINIC_SYSTEM` — the persona string. Edit slot times, service list, hours, etc.
 - `SERVICE_DURATIONS_MIN` — per-service appointment length.
 - `VALID_STATUSES` — allowed status values.

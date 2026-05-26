@@ -7,10 +7,9 @@ Agent gateway. Three jobs:
    the ElevenLabs-supplied system message, injects the ClawClinic persona,
    forwards to Hermes, and streams the SSE response back. An immediate
    role chunk keeps the SSE channel alive so ElevenLabs' cascade timer
-   does not kill us during Hermes' 3-5s time-to-first-token. An optional
-   filler phrase is emitted only if upstream stalls past
-   FILLER_AFTER_SECONDS (0 = disabled, since we set cascade_timeout=15s
-   on the ElevenLabs side).
+   does not kill us during Hermes' 3-5s time-to-first-token. On some slow
+   turns, the proxy may emit one natural filler phrase so the caller does
+   not sit in silence.
 
 2. /book — server tool for the ElevenLabs agent. Persists appointments
    to a CSV with overlap detection. Slot durations are derived from the
@@ -114,13 +113,19 @@ def write_all_bookings(rows: list) -> None:
 def make_confirmation() -> str:
     return f"BK-{uuid.uuid4().hex[:8].upper()}"
 
-# Filler disabled — we rely on the ElevenLabs cascade_timeout_seconds=15 setting
-# to absorb Hermes' 3-5s TTF. Set to a positive number to re-enable.
-FILLER_AFTER_SECONDS = 0  # 0 = disabled
+# Emit a short spoken filler on some slow turns. The delay is jittered and
+# the probability keeps the voice experience from sounding scripted.
+FILLER_PROBABILITY = 0.45  # 0 = disabled, 1 = always on slow turns
+FILLER_DELAY_RANGE_SECONDS = (2.2, 4.2)
 FILLERS = [
-    "One moment... ",
-    "Let me check... ",
-    "Just a sec... ",
+    "One moment while I check that. ",
+    "Let me check that for you. ",
+    "Just a second while I look that up. ",
+    "I’m checking the schedule now. ",
+    "Give me a moment to pull that up. ",
+    "I’ll take a quick look. ",
+    "Let me see what’s available. ",
+    "I’m looking into that now. ",
 ]
 
 CLAWCLINIC_SYSTEM = """You are ClawClinic, the AI voice receptionist for Downtown Dental Toronto.
@@ -133,10 +138,10 @@ PERSONA:
 
 CLINIC FACTS (use these exact values):
 - Clinic: Downtown Dental Toronto
-- Hours: Monday to Friday 9 AM to 6 PM, Saturday 10 AM to 4 PM, closed Sunday
-- Address: 123 Bay Street, Toronto, Ontario
+- Hours: Monday to Friday 8 AM to 6 PM, Saturday 9 AM to 2 PM, closed Sunday
+- Address: 123 King Street West, Toronto, Ontario
 - Phone bookings: collect name and call-back number, then say you will send an SMS link to confirm
-- Insurance accepted: Sun Life, Manulife, Green Shield, Canada Life, Blue Cross
+- Insurance accepted: Sun Life, Manulife, Canada Life, Green Shield, Pacific Blue Cross
 - Booking fee to the clinic: paid via x402 on GOAT Network (do not mention this unless asked)
 
 AVAILABLE SLOTS for booking (today is 2026-05-26):
@@ -150,6 +155,7 @@ AVAILABLE SLOTS for booking (today is 2026-05-26):
 When speaking to the caller, refer to slots in natural language (e.g. "tomorrow at 9 AM" or "Thursday afternoon"). When calling the booking tool, pass the slot as a full ISO 8601 datetime like 2026-05-27T09:00:00.
 
 BEHAVIOR FOR VOICE CALLS:
+- At the start of a new call, greet the caller first: "Hi, this is ClawClinic, the AI receptionist for Downtown Dental Toronto. I can help book appointments, check hours, answer insurance questions, or look up an existing booking. How can I help today?"
 - If asked about hours, give the hours directly.
 - If asked about insurance, list a few accepted providers and confirm if theirs is covered.
 - If they want to BOOK an appointment:
@@ -540,14 +546,16 @@ class Handler(BaseHTTPRequestHandler):
 
         sent_content_yet = False
         filler_emitted = False
+        should_emit_filler = random.random() < FILLER_PROBABILITY
+        filler_delay = random.uniform(*FILLER_DELAY_RANGE_SECONDS)
         start = time.time()
 
         try:
             while True:
-                # If filler is enabled and no content has arrived yet, race
-                # the upstream against the filler budget. Otherwise block.
-                if FILLER_AFTER_SECONDS > 0 and not sent_content_yet and not filler_emitted:
-                    timeout = max(0.05, FILLER_AFTER_SECONDS - (time.time() - start))
+                # On a sampled subset of slow turns, race upstream against a
+                # jittered filler budget. Otherwise block until Hermes speaks.
+                if should_emit_filler and not sent_content_yet and not filler_emitted:
+                    timeout = max(0.05, filler_delay - (time.time() - start))
                 else:
                     timeout = None
 
