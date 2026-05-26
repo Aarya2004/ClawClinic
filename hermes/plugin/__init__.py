@@ -302,18 +302,23 @@ _ONBOARD_HELP = (
     "Read (always safe):\n"
     "  /onboard                       — show current config + 24h spend\n"
     "  /onboard pending               — list pending confirmation tokens\n\n"
-    "Propose a change (returns a CONFIRM-ONBOARD-XXXXXX token):\n"
+    "Propose a change (returns a CONFIRM-ONBOARD-XXXXXX token; if an\n"
+    "operator phone is configured, also sends a 6-digit SMS code):\n"
     "  /onboard set-limit <usd>                    — per-restock autonomous limit\n"
     "  /onboard set-daily <usd>                    — rolling 24h cumulative cap\n"
     "  /onboard set-clinic name|hours|address <value>\n"
+    "  /onboard set-operator-phone <+14165550123>  — phone that receives OTPs\n"
+    "  /onboard set-operator-sms-required true|false\n"
     "  /onboard add-sku <SKU> <price> <threshold> <name…>\n"
     "  /onboard remove-sku <SKU>\n"
     "  /onboard reset                              — restore defaults\n\n"
     "Confirm or abort a pending proposal:\n"
-    "  /onboard confirm <CONFIRM-ONBOARD-XXXXXX>\n"
+    "  /onboard confirm <CONFIRM-ONBOARD-XXXXXX>                  ← literal-token-only\n"
+    "  /onboard confirm <CONFIRM-ONBOARD-XXXXXX> <6-digit code>   ← + SMS OTP\n"
     "  /onboard abort   <CONFIRM-ONBOARD-XXXXXX>\n\n"
-    "Approximate confirmations (e.g. 'yes', 'do it') are rejected. "
-    "The literal token must match exactly."
+    "When sms_required is true, the SMS code is mandatory. When it is false,\n"
+    "the literal token alone is accepted as a fallback if SMS fails.\n"
+    "Approximate confirmations ('yes', 'do it') are always rejected."
 )
 
 
@@ -334,6 +339,14 @@ def _onboard_show_config(mod) -> str:
     lines.append(f"  per-restock autonomous limit: ${float(spending.get('autonomous_limit_usd',0)):.2f}")
     lines.append(f"  rolling 24h cumulative cap:   ${float(spending.get('daily_cap_usd',0)):.2f}")
     lines.append(f"  spent in last 24h:            ${spent:.2f}")
+    lines.append("")
+    op = cfg.get("operator", {}) or {}
+    phone = (op.get("phone_e164") or "").strip()
+    masked = (phone[:3] + "***" + phone[-4:]) if len(phone) >= 8 else "(not set)"
+    sms_req = "yes" if op.get("sms_required") else "no"
+    lines.append("Operator (SMS OTP)")
+    lines.append(f"  phone:        {masked}")
+    lines.append(f"  sms_required: {sms_req}")
     lines.append("")
     lines.append("Inventory (thresholds + supplier prices)")
     if not inv:
@@ -359,15 +372,18 @@ def _onboard_show_config(mod) -> str:
     lines.append("    /onboard                 — show this view")
     lines.append("    /onboard pending         — list pending proposals")
     lines.append("    /onboard help            — full sub-action reference")
-    lines.append("  Propose (returns a CONFIRM-ONBOARD-XXXXXX token):")
+    lines.append("  Propose (token + optional SMS OTP):")
     lines.append("    /onboard set-limit <usd>                 — per-restock autonomous limit")
     lines.append("    /onboard set-daily <usd>                 — rolling 24h cumulative cap")
     lines.append("    /onboard set-clinic name|hours|address <value>")
+    lines.append("    /onboard set-operator-phone <+E.164>     — phone for OTPs")
+    lines.append("    /onboard set-operator-sms-required true|false")
     lines.append("    /onboard add-sku <SKU> <price> <threshold> <name…>")
     lines.append("    /onboard remove-sku <SKU>")
     lines.append("    /onboard reset")
     lines.append("  Apply / abort:")
-    lines.append("    /onboard confirm <CONFIRM-ONBOARD-XXXXXX>")
+    lines.append("    /onboard confirm <CONFIRM-ONBOARD-XXXXXX>                  ← literal-token-only")
+    lines.append("    /onboard confirm <CONFIRM-ONBOARD-XXXXXX> <6-digit code>   ← + SMS OTP")
     lines.append("    /onboard abort   <CONFIRM-ONBOARD-XXXXXX>")
     return "\n".join(lines)
 
@@ -389,7 +405,7 @@ def _onboard_show_pending(mod) -> str:
     return "\n".join(lines)
 
 
-def _onboard_apply_or_abort(mod, action: str, token: str) -> str:
+def _onboard_apply_or_abort(mod, action: str, token: str, otp: str | None = None) -> str:
     token = token.strip()
     if not token.startswith("CONFIRM-ONBOARD-"):
         return (
@@ -399,10 +415,39 @@ def _onboard_apply_or_abort(mod, action: str, token: str) -> str:
     if action == "abort":
         ok = mod.abort_proposal(token)
         return f"✅ Proposal {token} aborted." if ok else f"❌ No pending proposal {token}."
-    ok, msg, payload = mod.apply_proposal(token)
+    ok, msg, payload = mod.apply_proposal(token, otp)
     if not ok:
         return f"❌ {msg}"
     return f"✅ {msg} ({payload})"
+
+
+def _format_propose_result(action_summary: str, token: str, otp_status: dict) -> str:
+    """Single formatter for every 'we just staged a change' message."""
+    if not otp_status.get("ok"):
+        return (
+            f"❌ {action_summary}\n\n"
+            f"SMS confirmation is required but the send failed: "
+            f"{otp_status.get('sms_info','unknown')}.\n"
+            "Either set /onboard set-operator-sms-required false or fix Twilio."
+        )
+
+    lines = [f"📝 Proposed: {action_summary}"]
+    lines.append("")
+    if otp_status.get("sms_sent"):
+        masked = otp_status.get("phone_masked", "your phone")
+        lines.append(f"📱 A 6-digit code was sent via SMS to {masked}.")
+        if otp_status.get("sms_required"):
+            lines.append("SMS code is REQUIRED to apply this change.")
+            lines.append(f"  /onboard confirm {token} <6-digit-code>")
+        else:
+            lines.append("SMS code is optional (sms_required=false).")
+            lines.append(f"  /onboard confirm {token} <6-digit-code>  ← preferred")
+            lines.append(f"  /onboard confirm {token}                 ← literal-token-only fallback")
+    else:
+        lines.append("📵 No SMS sent (operator phone not configured or send failed).")
+        lines.append(f"  /onboard confirm {token}")
+    lines.append(f"  /onboard abort   {token}")
+    return "\n".join(lines)
 
 
 def _onboard_propose_set_limit(mod, args: list, field: str) -> str:
@@ -415,12 +460,11 @@ def _onboard_propose_set_limit(mod, args: list, field: str) -> str:
     err = mod.validate_spending(field, value)
     if err:
         return f"❌ {err}"
-    token = mod.propose_change("set_spending", {"field": field, "value": value})
     current = float(mod.load_config().get("spending", {}).get(field, 0))
-    return (
-        f"📝 Proposed: change {field} from ${current:.2f} → ${value:.2f}.\n\n"
-        f"To apply:  /onboard confirm {token}\n"
-        f"To abort:  /onboard abort {token}"
+    token, otp = mod.propose_change("set_spending", {"field": field, "value": value})
+    return _format_propose_result(
+        f"change {field} from ${current:.2f} → ${value:.2f}.",
+        token, otp,
     )
 
 
@@ -432,12 +476,32 @@ def _onboard_propose_set_clinic(mod, args: list) -> str:
     err = mod.validate_clinic(field, value)
     if err:
         return f"❌ {err}"
-    token = mod.propose_change("set_clinic_field", {"field": field, "value": value})
-    return (
-        f"📝 Proposed: set clinic.{field} = {value!r}.\n\n"
-        f"To apply:  /onboard confirm {token}\n"
-        f"To abort:  /onboard abort {token}"
-    )
+    token, otp = mod.propose_change("set_clinic_field", {"field": field, "value": value})
+    return _format_propose_result(f"set clinic.{field} = {value!r}.", token, otp)
+
+
+def _onboard_propose_set_operator(mod, args: list, field: str) -> str:
+    """Handles set-operator-phone <E.164> and set-operator-sms-required true|false."""
+    if len(args) != 1:
+        return f"Usage: /onboard set-operator-{field.replace('_','-')} <value>"
+    raw = args[0].strip()
+    if field == "phone_e164":
+        value: object = raw
+    elif field == "sms_required":
+        lower = raw.lower()
+        if lower in ("true", "1", "yes", "on"):
+            value = True
+        elif lower in ("false", "0", "no", "off"):
+            value = False
+        else:
+            return "❌ Use true or false."
+    else:
+        return f"❌ Unknown operator field {field!r}."
+    err = mod.validate_operator(field, value)
+    if err:
+        return f"❌ {err}"
+    token, otp = mod.propose_change("set_operator", {"field": field, "value": value})
+    return _format_propose_result(f"set operator.{field} = {value!r}.", token, otp)
 
 
 def _onboard_propose_add_sku(mod, args: list) -> str:
@@ -454,14 +518,13 @@ def _onboard_propose_add_sku(mod, args: list) -> str:
     err = mod.validate_add_sku(sku, name, price, threshold)
     if err:
         return f"❌ {err}"
-    token = mod.propose_change(
+    token, otp = mod.propose_change(
         "add_sku",
         {"sku": sku, "name": name, "unit_price_usd": price, "threshold": threshold},
     )
-    return (
-        f"📝 Proposed: add SKU {sku} ({name}) @ ${price:.2f}, threshold {threshold}.\n\n"
-        f"To apply:  /onboard confirm {token}\n"
-        f"To abort:  /onboard abort {token}"
+    return _format_propose_result(
+        f"add SKU {sku} ({name}) @ ${price:.2f}, threshold {threshold}.",
+        token, otp,
     )
 
 
@@ -472,21 +535,13 @@ def _onboard_propose_remove_sku(mod, args: list) -> str:
     cfg = mod.load_config()
     if sku not in cfg.get("inventory_config", {}):
         return f"❌ SKU {sku} is not in the current inventory config."
-    token = mod.propose_change("remove_sku", {"sku": sku})
-    return (
-        f"📝 Proposed: remove SKU {sku}.\n\n"
-        f"To apply:  /onboard confirm {token}\n"
-        f"To abort:  /onboard abort {token}"
-    )
+    token, otp = mod.propose_change("remove_sku", {"sku": sku})
+    return _format_propose_result(f"remove SKU {sku}.", token, otp)
 
 
 def _onboard_propose_reset(mod) -> str:
-    token = mod.propose_change("reset", {})
-    return (
-        "📝 Proposed: reset clinic configuration to defaults.\n\n"
-        f"To apply:  /onboard confirm {token}\n"
-        f"To abort:  /onboard abort {token}"
-    )
+    token, otp = mod.propose_change("reset", {})
+    return _format_propose_result("reset clinic configuration to defaults.", token, otp)
 
 
 def _onboard(args: str) -> str:
@@ -511,8 +566,9 @@ def _onboard(args: str) -> str:
         return _onboard_show_pending(mod)
     if head == "confirm":
         if not rest:
-            return "❌ Usage: /onboard confirm <CONFIRM-ONBOARD-XXXXXX>"
-        return _onboard_apply_or_abort(mod, "confirm", rest[0])
+            return "❌ Usage: /onboard confirm <CONFIRM-ONBOARD-XXXXXX> [6-digit SMS code]"
+        otp = rest[1] if len(rest) >= 2 else None
+        return _onboard_apply_or_abort(mod, "confirm", rest[0], otp)
     if head == "abort":
         if not rest:
             return "❌ Usage: /onboard abort <CONFIRM-ONBOARD-XXXXXX>"
@@ -523,6 +579,10 @@ def _onboard(args: str) -> str:
         return _onboard_propose_set_limit(mod, rest, "daily_cap_usd")
     if head == "set-clinic":
         return _onboard_propose_set_clinic(mod, rest)
+    if head == "set-operator-phone":
+        return _onboard_propose_set_operator(mod, rest, "phone_e164")
+    if head == "set-operator-sms-required":
+        return _onboard_propose_set_operator(mod, rest, "sms_required")
     if head == "add-sku":
         return _onboard_propose_add_sku(mod, rest)
     if head == "remove-sku":
